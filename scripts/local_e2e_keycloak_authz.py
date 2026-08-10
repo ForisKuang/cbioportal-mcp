@@ -139,6 +139,29 @@ async def run(keycloak_url: str, proxy_url: str) -> None:
         }
     ], indirect_mutations
 
+    # `clinical_event_data` has no study or patient column at all - it is two
+    # joins removed from `cancer_study` (clinical_event_data ->
+    # clinical_event -> patient -> cancer_study). Alice must only see the
+    # event data attached to her own study's patients.
+    two_hop_clinical_event_data = await _call_with_token(
+        proxy_url,
+        alice_token,
+        "clickhouse_run_select_query",
+        {
+            "query": (
+                "SELECT clinical_event_id, attr_key, attr_value "
+                "FROM clinical_event_data ORDER BY clinical_event_id"
+            )
+        },
+    )
+    assert two_hop_clinical_event_data["rows"] == [
+        {
+            "clinical_event_id": 1001,
+            "attr_key": "DIAGNOSIS_TYPE",
+            "attr_value": "Primary",
+        }
+    ], two_hop_clinical_event_data
+
     print("Local Keycloak authz e2e passed.")
     print("Alice access:", alice_access)
     print("Bob access:", bob_access)

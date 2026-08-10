@@ -48,22 +48,45 @@ GROUP_HEADER_CANDIDATES = (
 PROTECTED_QUERY_MARKERS = (
     "cancer_study",
     "cancer_study_query_preferences",
+    "clinical_attribute_meta",
     "clinical_data",
     "clinical_data_derived",
     "clinical_event",
+    "clinical_event_data",
+    "clinical_patient",
+    "clinical_sample",
     "genetic_alteration",
     "genetic_alteration_derived",
     "genetic_profile",
     "genomic_event_derived",
     "gene_mutation_frequency",
+    "gene_panel",
+    "gene_panel_list",
     "top_mutated_genes",
     "sample",
     "sample_to_gene_panel_derived",
     "patient",
     "mutation",
+    "resource_definition",
     "resource_sample",
     "resource_patient",
     "resource_study",
+)
+
+# Tables known to carry no study-scoped data - reference/lookup data that is
+# the same across every study (genes, OncoTree, etc). Anything NOT in this
+# allowlist and NOT in PROTECTED_QUERY_MARKERS is neither known-safe nor
+# known-restricted; see test_clickhouse_init_sql_coverage.py, which fails CI
+# if the local e2e mock schema ever drifts from this pair of lists.
+STUDY_AGNOSTIC_REFERENCE_TABLES = frozenset(
+    {
+        "gene",
+        "gene_alias",
+        "oncotree",
+        "type_of_cancer",
+        "reference_genome",
+        "reference_genome_gene",
+    }
 )
 
 

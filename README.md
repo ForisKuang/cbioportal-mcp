@@ -122,12 +122,39 @@ In this mode, the MCP server passes the resolved study allowlist to ClickHouse
 as a query setting on every SELECT. Row policies should then filter each
 study-scoped table, including indirect tables such as raw `mutation` rows where
 the study is derived through `sample_id`, `genetic_profile_id`, or another
-provenance path. This is the recommended defense-in-depth mode for restricted
-deployments; the app-level guard still rejects explicit requests for denied
-study IDs and blocks attempts to set the internal allowlist setting in user SQL.
+provenance path - and tables that are *multiple* joins removed from a study
+column (e.g. `clinical_event_data`, which only has `clinical_event_id`, itself
+resolved through `clinical_event.patient_id` -> `patient.cancer_study_identifier`).
+This is the recommended defense-in-depth mode for restricted deployments; the
+app-level guard still rejects explicit requests for denied study IDs and blocks
+attempts to set the internal allowlist setting in user SQL.
 
-For a runnable local Keycloak + ClickHouse + MCP authz stack, see
-[`docker/local-e2e/`](docker/local-e2e/).
+The MCP server's own startup permission check requires a database-wide
+`GRANT SELECT ON db.* TO <restricted-role>` (per-table grants don't satisfy
+it), so that grant can't be withheld to close the "forgotten table" gap.
+Instead, pair it with a database-wide **default-deny row policy**:
+
+```sql
+CREATE ROW POLICY cbioportal_mcp_default_deny
+ON <db>.* USING 0 TO <restricted-role>;
+```
+
+This auto-covers tables created after the policy, the same way the wildcard
+grant does. ClickHouse combines multiple `PERMISSIVE` row policies on one
+table with `OR`, so a table with no policy of its own is stuck at `0`
+(nothing visible), while a table with its own policy gets
+`0 OR <real condition>` = `<real condition>`. A newly added table is
+therefore unreadable by default until someone adds a policy deciding how it
+maps back to a study (or explicitly allowlists it as study-agnostic
+reference data, e.g. `gene`/`oncotree`, with its own `USING 1` policy).
+
+For a runnable local Keycloak + ClickHouse + MCP authz stack demonstrating
+this pattern - including the direct, one-join, and two-join cases - see
+[`docker/local-e2e/`](docker/local-e2e/). `tests/test_clickhouse_init_sql_coverage.py`
+guards that mock schema against drift: every table must have its own row
+policy and a classification in `study_access.py` as either study-scoped
+(`PROTECTED_QUERY_MARKERS`) or study-agnostic
+(`STUDY_AGNOSTIC_REFERENCE_TABLES`).
 
 ## Preparing the database
 

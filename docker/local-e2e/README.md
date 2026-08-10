@@ -8,8 +8,23 @@ This stack validates the restricted-study access flow end to end:
 4. cBioPortal MCP maps Keycloak groups to allowed studies through `study-acl.json`.
 5. cBioPortal MCP passes the resolved allowlist to ClickHouse as
    `SQL_cbiomcp_allowed_studies`.
-6. ClickHouse row policies filter direct study tables and an indirect
-   `mutation` table where study provenance is derived through `sample_id`.
+6. ClickHouse row policies filter direct study tables and indirect tables
+   where study provenance is derived through a join: `mutation` and
+   `clinical_event` are one join away (`sample_id`/`patient_id`), and
+   `clinical_event_data` is two joins away (`clinical_event_id` ->
+   `clinical_event.patient_id` -> `patient.cancer_study_identifier`).
+7. A database-wide default-deny row policy (`ON cbioportal_authz_e2e.*
+   USING 0`) backstops every table, including ones added later. ClickHouse
+   combines multiple PERMISSIVE row policies on a table with OR, so a table
+   with no policy of its own is stuck at `0` (nothing visible) even though it
+   inherits the database-wide `GRANT SELECT` the server's startup check
+   requires; a table with its own policy gets `0 OR <real condition>`. This
+   was verified directly against a running ClickHouse 24.12 container: a
+   table created *after* the default-deny policy, with no policy of its own,
+   returned zero rows to the restricted user rather than leaking. See
+   `tests/test_clickhouse_init_sql_coverage.py`, which fails CI if a table in
+   this file is missing its own row policy or isn't classified in
+   `study_access.py`'s `PROTECTED_QUERY_MARKERS` / `STUDY_AGNOSTIC_REFERENCE_TABLES`.
 
 This proxy is for local development only. Production should use a hardened
 ingress/auth proxy or gateway backed by Keycloak.
@@ -107,6 +122,10 @@ authorization path after changing auth, ACL, or row-policy logic.
    - Alice is denied when explicitly querying `study_beta`
    - Alice can query raw `mutation` without a study column and receives only
      the mutation derived from `study_alpha` through `mutation.sample_id`
+   - Alice can query raw `clinical_event_data`, which has no study *or*
+     patient column, and receives only the row two joins removed from her
+     study (`clinical_event_data` -> `clinical_event.patient_id` ->
+     `patient.cancer_study_identifier`)
 
 6. Expected success output:
 
@@ -120,6 +139,49 @@ authorization path after changing auth, ACL, or row-policy logic.
    the ClickHouse volume was initialized before the mutation seed table existed.
    Run `docker compose -f docker/local-e2e/docker-compose.yml down -v`, start
    the stack again, and rerun the verifier.
+
+8. Run the full test suite, including the SQL-file drift guard:
+
+   ```bash
+   uv run pytest -q
+   ```
+
+   `tests/test_clickhouse_init_sql_coverage.py` fails if any table in
+   `clickhouse-init.sql` is missing the wildcard grant, the default-deny
+   wildcard row policy, its own table-specific row policy, or a
+   classification in `study_access.py`'s `PROTECTED_QUERY_MARKERS` /
+   `STUDY_AGNOSTIC_REFERENCE_TABLES`.
+
+9. To manually confirm the fail-closed default for a table nobody has
+   scoped yet (this is what step 7's default-deny wildcard row policy is
+   for), with the stack still running from step 2:
+
+   ```bash
+   # Add a table after the stack (and its row policies) already exist,
+   # with no table-specific policy of its own.
+   docker exec local-e2e-clickhouse-1 clickhouse-client -q "
+     CREATE TABLE cbioportal_authz_e2e.surprise_new_table (secret String) ENGINE=Memory;
+     INSERT INTO cbioportal_authz_e2e.surprise_new_table VALUES ('leaked-if-fail-open');
+   "
+
+   # Query it as the restricted MCP user, with Alice's allowlist setting.
+   docker exec local-e2e-clickhouse-1 clickhouse-client --user mcp_authz --password mcp_authz_pw -q "
+     SELECT * FROM cbioportal_authz_e2e.surprise_new_table
+     SETTINGS SQL_cbiomcp_allowed_studies = 'study_alpha'
+   "
+   # Expect zero rows printed (not an error, not the secret value) - the
+   # default-deny policy on db.* auto-covers this table even though it was
+   # created after that policy and after the stack started.
+
+   docker exec local-e2e-clickhouse-1 clickhouse-client -q "DROP TABLE cbioportal_authz_e2e.surprise_new_table"
+   ```
+
+   This also confirms why the database-wide `GRANT SELECT ON db.*` can't be
+   replaced with per-table grants to close this gap: the server's own
+   startup check (`ensure_db_permissions`) does `CHECK GRANT SELECT ON
+   db.*`, which per-table grants alone do not satisfy even when every
+   existing table is individually granted. The row policy, not the grant, is
+   what has to be fail-closed.
 
 ## Local Test Users
 

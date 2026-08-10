@@ -115,6 +115,35 @@ def test_clickhouse_row_policy_mode_allows_indirect_protected_queries(monkeypatc
         guard_query_study_access("SELECT * FROM mutation ORDER BY mutation_event_id", McpConfig())
 
 
+def test_clickhouse_row_policy_mode_allows_two_hop_indirect_queries(monkeypatch):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("CBIOPORTAL_MCP_CLICKHOUSE_ROW_POLICY_ENABLED", "true")
+
+    with _headers(
+        {
+            "x-user-id": "user-1",
+            "x-cbioportal-allowed-studies": "study_a",
+        }
+    ):
+        guard_query_study_access(
+            "SELECT * FROM clinical_event_data ORDER BY clinical_event_id", McpConfig()
+        )
+
+
+def test_restricted_query_rejects_indirect_table_without_row_policies(monkeypatch):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_REQUIRED", "true")
+
+    with _headers(
+        {
+            "x-user-id": "user-1",
+            "x-cbioportal-allowed-studies": "study_a",
+        }
+    ), pytest.raises(AuthorizationError, match="explicit literal"):
+        guard_query_study_access("SELECT * FROM clinical_event_data", McpConfig())
+
+
 def test_clickhouse_row_policy_mode_still_rejects_explicit_denied_study(monkeypatch):
     monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
     monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_REQUIRED", "true")
