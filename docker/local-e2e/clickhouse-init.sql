@@ -112,6 +112,16 @@ CREATE ROLE IF NOT EXISTS cbioportal_mcp_study_restricted;
 GRANT cbioportal_mcp_study_restricted TO mcp_authz;
 SET DEFAULT ROLE cbioportal_mcp_study_restricted TO mcp_authz;
 
+-- Stand-in for a real deployment's CLICKHOUSE_ADMIN_USER (see
+-- scripts/apply_sql.sh), used only by scripts/verify_row_policy_coverage.py.
+-- Deliberately NOT granted SELECT on cbioportal_authz_e2e's actual row
+-- data - only metadata visibility (SHOW TABLES) plus system.row_policies,
+-- which is enough to enumerate tables and their policy coverage without
+-- this identity being able to read a single row of study data itself.
+CREATE USER IF NOT EXISTS local_e2e_admin IDENTIFIED WITH plaintext_password BY 'local_e2e_admin_pw';
+GRANT SHOW TABLES ON cbioportal_authz_e2e.* TO local_e2e_admin;
+GRANT SELECT ON system.row_policies TO local_e2e_admin;
+
 -- The MCP server's own startup permission check (ensure_db_permissions)
 -- requires `CHECK GRANT SELECT ON <db>.*` to pass, so this grant must stay
 -- database-wide - per-table grants do not satisfy that check even when every

@@ -25,6 +25,21 @@ This stack validates the restricted-study access flow end to end:
    `tests/test_clickhouse_init_sql_coverage.py`, which fails CI if a table in
    this file is missing its own row policy or isn't classified in
    `study_access.py`'s `PROTECTED_QUERY_MARKERS` / `STUDY_AGNOSTIC_REFERENCE_TABLES`.
+8. `scripts/verify_row_policy_coverage.py` performs the same coverage check
+   *live*, against a running ClickHouse's `system.tables` / `system.row_policies`,
+   rather than by parsing the mock SQL file - this is what a real deployment
+   runs before enabling `CBIOPORTAL_MCP_CLICKHOUSE_ROW_POLICY_ENABLED=true`,
+   and periodically after, to catch drift (e.g. a table added by an
+   unrelated cBioPortal schema migration with no row policy). It uses
+   separate ADMIN credentials (`local_e2e_admin` here, `CLICKHOUSE_ADMIN_USER`
+   in production - the same split `scripts/apply_sql.sh` uses), not the
+   MCP's runtime `mcp_authz` user: reading `system.row_policies` requires a
+   grant that is *not* scoped to the querying user's own database access
+   (once granted, it exposes policy metadata for every database on the
+   cluster), so granting it to the runtime role would leak that metadata
+   through the `clickhouse_run_select_query` arbitrary-SQL tool. Verified
+   this admin identity needs only `GRANT SHOW TABLES ON <db>.*` (metadata,
+   no row data) plus `GRANT SELECT ON system.row_policies` - nothing else.
 
 This proxy is for local development only. Production should use a hardened
 ingress/auth proxy or gateway backed by Keycloak.
@@ -182,6 +197,33 @@ authorization path after changing auth, ACL, or row-policy logic.
    db.*`, which per-table grants alone do not satisfy even when every
    existing table is individually granted. The row policy, not the grant, is
    what has to be fail-closed.
+
+10. Run the live coverage check (needs the ClickHouse container only -
+    `docker compose -f docker/local-e2e/docker-compose.yml up -d clickhouse`
+    is enough, the rest of the stack isn't required):
+
+    ```bash
+    export CLICKHOUSE_HOST=127.0.0.1 CLICKHOUSE_PORT=8123 CLICKHOUSE_DATABASE=cbioportal_authz_e2e
+    export CLICKHOUSE_ADMIN_USER=local_e2e_admin CLICKHOUSE_ADMIN_PASSWORD=local_e2e_admin_pw
+    export CLICKHOUSE_SECURE=false
+    uv run python scripts/verify_row_policy_coverage.py
+    ```
+
+    Expect `OK: every table has row-policy coverage ...` and exit code 0. To
+    confirm it actually catches a gap (not just a script that always says
+    OK), add a table with no policy and rerun:
+
+    ```bash
+    docker exec local-e2e-clickhouse-1 clickhouse-client -q "
+      CREATE TABLE cbioportal_authz_e2e.forgotten_table (secret String) ENGINE=Memory
+    "
+    uv run python scripts/verify_row_policy_coverage.py
+    # Expect exit code 1 and `forgotten_table` listed as a coverage gap.
+
+    docker exec local-e2e-clickhouse-1 clickhouse-client -q "
+      DROP TABLE cbioportal_authz_e2e.forgotten_table
+    "
+    ```
 
 ## Local Test Users
 

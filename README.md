@@ -156,6 +156,21 @@ policy and a classification in `study_access.py` as either study-scoped
 (`PROTECTED_QUERY_MARKERS`) or study-agnostic
 (`STUDY_AGNOSTIC_REFERENCE_TABLES`).
 
+Before enabling `CBIOPORTAL_MCP_CLICKHOUSE_ROW_POLICY_ENABLED=true` against a
+real database - and periodically after, since an unrelated cBioPortal schema
+migration can add a table nobody's scoped yet - run
+[`scripts/verify_row_policy_coverage.py`](scripts/verify_row_policy_coverage.py),
+which performs the same check live against `system.tables` /
+`system.row_policies` instead of against the mock SQL file. It takes
+**admin** credentials (`CLICKHOUSE_ADMIN_USER`/`CLICKHOUSE_ADMIN_PASSWORD`,
+the same split [`scripts/apply_sql.sh`](scripts/apply_sql.sh) uses), not the
+MCP's runtime SELECT-only user: reading `system.row_policies` requires a
+grant that is *not* scoped to the querying user's own database access, so
+granting it to the runtime role would leak policy metadata for every
+database on the cluster through the `clickhouse_run_select_query`
+arbitrary-SQL tool. The admin identity only needs `SHOW TABLES` on the
+target database (metadata, not row data) plus `SELECT ON system.row_policies`.
+
 ## Preparing the database
 
 **We strongly recommend pointing the MCP at a *separate* ClickHouse database, not your production cBioPortal database directly.** Two reasons:
