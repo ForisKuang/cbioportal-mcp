@@ -129,10 +129,20 @@ This is the recommended defense-in-depth mode for restricted deployments; the
 app-level guard still rejects explicit requests for denied study IDs and blocks
 attempts to set the internal allowlist setting in user SQL.
 
-The MCP server's own startup permission check requires a database-wide
+Per-table grants (no wildcard) would mechanically close the "forgotten
+table" gap on their own - ClickHouse just denies an ungranted table
+outright, which is fail-closed too. Two things rule that out here,
+independent of whether it would work: the MCP server's own startup
+permission check requires the literal wildcard-scoped
 `GRANT SELECT ON db.* TO <restricted-role>` (per-table grants don't satisfy
-it), so that grant can't be withheld to close the "forgotten table" gap.
-Instead, pair it with a database-wide **default-deny row policy**:
+that check even when every existing table is individually granted), and
+`SHOW TABLES` / schema discovery is grant-scoped in ClickHouse, so per-table
+grants would make an unscoped table invisible to `clickhouse_list_tables()`,
+not just inaccessible. Keeping the wildcard grant for those two reasons
+means it says yes to every table, forgotten or not, by construction - there
+is no room left in the grant layer to say no to one specific table. Instead,
+pair it with a database-wide **default-deny row policy**, which is the only
+layer left that can say no:
 
 ```sql
 CREATE ROW POLICY cbioportal_mcp_default_deny

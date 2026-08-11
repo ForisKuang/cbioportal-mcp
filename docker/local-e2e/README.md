@@ -191,12 +191,27 @@ authorization path after changing auth, ACL, or row-policy logic.
    docker exec local-e2e-clickhouse-1 clickhouse-client -q "DROP TABLE cbioportal_authz_e2e.surprise_new_table"
    ```
 
-   This also confirms why the database-wide `GRANT SELECT ON db.*` can't be
-   replaced with per-table grants to close this gap: the server's own
-   startup check (`ensure_db_permissions`) does `CHECK GRANT SELECT ON
-   db.*`, which per-table grants alone do not satisfy even when every
-   existing table is individually granted. The row policy, not the grant, is
-   what has to be fail-closed.
+   Why the row policy is doing this job instead of the grant: per-table
+   grants (no wildcard) *would* mechanically close this same gap on their
+   own - ClickHouse just refuses to query an ungranted table outright
+   (`ACCESS_DENIED`), which is fail-closed too. But two other things rule
+   per-table grants out here, independent of whether they'd work:
+   1. The server's own startup check (`ensure_db_permissions`) does
+      `CHECK GRANT SELECT ON db.*`, which checks for that literal
+      wildcard-scoped grant object - verified live that per-table grants do
+      not satisfy it even when every existing table is individually
+      granted. Switching to per-table grants makes the server refuse to
+      start, before row policies even enter the picture.
+   2. `SHOW TABLES` / schema discovery is grant-scoped in ClickHouse: with
+      per-table grants, a table nobody's granted yet isn't just
+      inaccessible, it's *invisible* to `clickhouse_list_tables()` - worse
+      for the agent than "visible but empty."
+
+   Once the wildcard grant is kept for those two reasons, it says "yes" to
+   every table, forgotten or not, by construction - there's no room left in
+   the grant layer to say no to one specific table. So the row policy is
+   the only layer left that *can* say no, which is why the default-deny
+   fallback lives there instead.
 
 10. Run the live coverage check (needs the ClickHouse container only -
     `docker compose -f docker/local-e2e/docker-compose.yml up -d clickhouse`

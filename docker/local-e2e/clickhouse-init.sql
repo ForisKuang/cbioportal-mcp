@@ -122,12 +122,19 @@ CREATE USER IF NOT EXISTS local_e2e_admin IDENTIFIED WITH plaintext_password BY 
 GRANT SHOW TABLES ON cbioportal_authz_e2e.* TO local_e2e_admin;
 GRANT SELECT ON system.row_policies TO local_e2e_admin;
 
--- The MCP server's own startup permission check (ensure_db_permissions)
--- requires `CHECK GRANT SELECT ON <db>.*` to pass, so this grant must stay
--- database-wide - per-table grants do not satisfy that check even when every
--- existing table is individually granted (verified against ClickHouse
--- 24.12). Fail-closed protection therefore cannot come from withholding the
--- grant; it comes from the default-deny wildcard ROW POLICY below.
+-- Per-table grants (no wildcard) would mechanically fail-close a forgotten
+-- table too - ClickHouse just denies an ungranted table outright. But two
+-- things rule that out here regardless of whether it would work: (1) the
+-- MCP server's own startup check (ensure_db_permissions) does
+-- `CHECK GRANT SELECT ON <db>.*`, which per-table grants do not satisfy
+-- even when every existing table is individually granted (verified against
+-- ClickHouse 24.12); (2) SHOW TABLES / schema discovery is grant-scoped, so
+-- per-table grants would make an ungranted table invisible to
+-- clickhouse_list_tables(), not just inaccessible. Keeping the grant
+-- wildcard means it says yes to every table, forgotten or not, by
+-- construction - so fail-closed protection has to come from the
+-- default-deny wildcard ROW POLICY below instead, since the grant layer no
+-- longer has room to say no to any one table.
 GRANT SELECT ON cbioportal_authz_e2e.* TO cbioportal_mcp_study_restricted;
 
 -- Default-deny fallback: applies to every table in the database, including
