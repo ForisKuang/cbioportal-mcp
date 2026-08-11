@@ -18,6 +18,14 @@ in a deployment, and periodically after (e.g. after cBioPortal schema
 migrations) to catch drift - a new table added with no row policy of its
 own.
 
+This is the row-level counterpart to the server's own startup check
+(cbioportal_mcp.authentication.permissions.ensure_db_permissions), which
+only ever verifies database-wide GRANT breadth - whether a table is
+reachable at all - and deliberately does not check ROW POLICY coverage -
+which rows come back once it is. See that module's docstring for the full
+reasoning on why the two checks live in different places with different
+credentials, rather than one being folded into the other.
+
 Required env (or flags):
   CLICKHOUSE_HOST
   CLICKHOUSE_DATABASE     target database (e.g. the prepped LLM clone)
