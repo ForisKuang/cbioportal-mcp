@@ -111,6 +111,49 @@ def _extract_user_identity() -> tuple[str | None, str | None, str]:
         return None, None, "unknown"
 
 
+def _extract_oauth_identity() -> tuple[str | None, str | None]:
+    """Read the verified caller identity from a validated OAuth access token.
+
+    Populated only when this deployment has OAuth enabled (see
+    ``cbioportal_mcp.auth._build_auth_provider``) and the caller completed a
+    real Google login — unlike ``_extract_user_identity`` above, which just
+    trusts whatever x-user-id header LibreChat happens to send, this is
+    cryptographically verified by FastMCP before the request ever reaches
+    this middleware.
+
+    Returns (user_id, user_email) from the token's ``sub``/``email`` claims,
+    either may be None. Returns (None, None) when OAuth isn't enabled for
+    this deployment, or the caller has no token (stdio transport, or an
+    unauthenticated HTTP deployment).
+    """
+    try:
+        from fastmcp.server.dependencies import get_access_token
+
+        token = get_access_token()
+        if token is None:
+            return None, None
+        claims = token.claims or {}
+        return claims.get("sub") or None, claims.get("email") or None
+    except Exception as exc:
+        logger.debug("_extract_oauth_identity failed: %s", exc)
+        return None, None
+
+
+def _resolve_caller_identity() -> tuple[str | None, str | None, str]:
+    """Resolve (user_id, user_email, client_kind) for the current caller.
+
+    Prefers the verified OAuth identity (``client_kind = "oauth"``) over the
+    trusted-but-unverified x-user-id header LibreChat sends, falling back to
+    the header-based resolution (``_extract_user_identity``) when no OAuth
+    token is present — e.g. this deployment has OAuth disabled, or the caller
+    is LibreChat, which does not yet forward an OAuth token of its own.
+    """
+    user_id, user_email = _extract_oauth_identity()
+    if user_id is not None:
+        return user_id, user_email, "oauth"
+    return _extract_user_identity()
+
+
 def _extract_mcp_client_info(
     context: MiddlewareContext[mt.CallToolRequestParams],
 ) -> tuple[str | None, str | None]:
@@ -284,8 +327,15 @@ class TelemetryMiddleware(Middleware):
       network.client.ip    Original client IP from X-Forwarded-For (HTTP only)
       mcp.tool.success     True on success, False when an exception propagates
       error.type           Exception class name on failure
-      mcp.client_kind       "librechat" | "direct" | "unknown", from the
-                            x-user-id header convention (see _extract_user_identity).
+      mcp.client_kind       "oauth" | "librechat" | "direct" | "unknown". "oauth"
+                            means the caller completed a real OAuth login and
+                            enduser.id is a verified identity (see
+                            _extract_oauth_identity); "librechat" | "direct" |
+                            "unknown" fall back to the trusted-but-unverified
+                            x-user-id header convention (see
+                            _extract_user_identity) when OAuth isn't enabled
+                            for this deployment, or the caller hasn't been
+                            updated to use it yet (e.g. LibreChat today).
                             Named to avoid colliding with mcp.client.name/version
                             below — Datadog treats dotted attribute names as a
                             hierarchy, so a bare "mcp.client" tag alongside
@@ -314,7 +364,7 @@ class TelemetryMiddleware(Middleware):
     ) -> mt.CallToolResult:
         tool_name = getattr(context.message, "name", None) or "unknown"
         arguments = getattr(context.message, "arguments", {}) or {}
-        user_id, user_email, client = _extract_user_identity()
+        user_id, user_email, client = _resolve_caller_identity()
         client_name, client_version = _extract_mcp_client_info(context)
         session_id = _extract_session_id(context)
 

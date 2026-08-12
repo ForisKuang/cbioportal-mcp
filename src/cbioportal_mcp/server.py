@@ -28,6 +28,7 @@ from fastmcp import FastMCP
 
 from cbioportal_mcp.env import get_mcp_config, TransportType
 from cbioportal_mcp.authentication.permissions import ensure_db_permissions
+from cbioportal_mcp.auth import _build_auth_provider
 from cbioportal_mcp.telemetry import configure_telemetry, TelemetryMiddleware
 
 logger = logging.getLogger(__name__)
@@ -230,6 +231,7 @@ def _build_hierarchy_path(code: str, entries_by_code: dict[str, dict]) -> str:
 mcp = FastMCP(
     name="cBioPortal MCP Server",
     instructions=_load_resource("system-prompt.md"),
+    auth=_build_auth_provider(),
 )
 
 

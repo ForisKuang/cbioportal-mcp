@@ -115,6 +115,35 @@ class McpConfig:
 
         return str(os.getenv("CLICKHOUSE_DATABASE", "cgds_public_2025_06_24"))
 
+    @property
+    def google_client_id(self) -> Optional[str]:
+        """Google OAuth client ID (from Google Cloud Console).
+
+        Example: "123-abc.apps.googleusercontent.com".
+
+        One of the three Google OAuth settings gating whether OAuth is enabled
+        at all — see `cbioportal_mcp.auth._build_auth_provider`. Any Google
+        account can authenticate; there is no Workspace-domain restriction.
+        """
+        value = os.getenv("CBIOPORTAL_MCP_GOOGLE_CLIENT_ID")
+        return value if value else None
+
+    @property
+    def google_client_secret(self) -> Optional[str]:
+        """Google OAuth client secret (from Google Cloud Console)."""
+        value = os.getenv("CBIOPORTAL_MCP_GOOGLE_CLIENT_SECRET")
+        return value if value else None
+
+    @property
+    def google_base_url(self) -> Optional[str]:
+        """This server's own public URL, used to construct its OAuth redirect/callback URIs.
+
+        Example: "https://mcp.cbioportal.org". Must match a redirect URI
+        registered on the Google OAuth client (base_url + "/auth/callback").
+        """
+        value = os.getenv("CBIOPORTAL_MCP_GOOGLE_BASE_URL")
+        return value if value else None
+
 
 # Global instance placeholders for the singleton pattern
 _MCP_CONFIG_INSTANCE = None
