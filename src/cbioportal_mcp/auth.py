@@ -63,6 +63,18 @@ def _build_auth_provider() -> GoogleProvider | None:
         client_id=client_id,
         client_secret=client_secret,
         base_url=base_url,
+        # Request `openid`, `email`, AND `profile` so `enduser.email`
+        # populates on spans. Empirically, FastMCP's GoogleTokenVerifier
+        # hits Google's legacy /oauth2/v2/userinfo endpoint which only
+        # returns the `email` field when the token also carries `profile`
+        # scope — even though the token was granted `email`. Requesting
+        # `email` alone leaves telemetry.py's `_extract_oauth_identity`
+        # with only `sub` (opaque Google account ID), which can't be
+        # mapped back to a person without a live OAuth session for that
+        # user. Neither `email` nor `profile` is a sensitive Google scope;
+        # no verification cycle required, adds ~one line each to the
+        # consent screen.
+        required_scopes=["openid", "email", "profile"],
         # Skips FastMCP's own consent interstitial so the flow goes straight
         # to Google's real login page — a temporary UX call, not a security
         # one: FastMCP's docs flag this as normally only for local dev, since
