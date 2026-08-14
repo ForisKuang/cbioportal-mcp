@@ -63,4 +63,12 @@ def _build_auth_provider() -> GoogleProvider | None:
         client_id=client_id,
         client_secret=client_secret,
         base_url=base_url,
+        # Skips FastMCP's own consent interstitial so the flow goes straight
+        # to Google's real login page — a temporary UX call, not a security
+        # one: FastMCP's docs flag this as normally only for local dev, since
+        # the consent screen is what protects against a malicious MCP client
+        # silently getting authorized without the user seeing which app is
+        # asking for access ("confused deputy" problem). Revisit before wide
+        # rollout — the fix there is a custom-branded consent page, not this.
+        require_authorization_consent=False,
     )
