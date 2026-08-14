@@ -17,6 +17,7 @@ import base64
 from unittest.mock import patch
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AccessToken
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -211,6 +212,55 @@ def test_mcp_client_tag_is_direct_when_no_x_user_id_header():
     tool_spans = [s for s in spans if s.name == "mcp.tool/ping"]
     assert tool_spans, "Expected an mcp.tool/ping span"
     assert tool_spans[0].attributes["mcp.client_kind"] == "direct"
+
+
+def test_mcp_client_tag_is_oauth_when_access_token_present():
+    """
+    A caller with a verified OAuth access token (this deployment has OAuth
+    enabled and the caller completed a real Keycloak login) must be tagged
+    mcp.client_kind = "oauth" with enduser.id from the token's sub claim —
+    the strongest identity tier, distinct from the trusted-but-unverified
+    x-user-id header path.
+    """
+    token = AccessToken(
+        token="fake-token",
+        client_id="fake-client",
+        scopes=[],
+        claims={"sub": "keycloak-user-abc", "email": "alice@example.org"},
+    )
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=token):
+        spans = _run_with_span_capture(
+            lambda client: _mcp_call(client, "ping", headers={})
+        )
+
+    tool_spans = [s for s in spans if s.name == "mcp.tool/ping"]
+    assert tool_spans, "Expected an mcp.tool/ping span"
+    attrs = tool_spans[0].attributes
+    assert attrs["mcp.client_kind"] == "oauth"
+    assert attrs["enduser.id"] == "keycloak-user-abc"
+
+
+def test_oauth_identity_takes_precedence_over_x_user_id_header():
+    """
+    When both a verified OAuth token and the trusted-but-unverified x-user-id
+    header are present on the same request, the verified identity must win.
+    """
+    token = AccessToken(
+        token="fake-token",
+        client_id="fake-client",
+        scopes=[],
+        claims={"sub": "keycloak-user-abc"},
+    )
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=token):
+        spans = _run_with_span_capture(
+            lambda client: _mcp_call(client, "ping", headers={"x-user-id": "librechat-user-1"})
+        )
+
+    tool_spans = [s for s in spans if s.name == "mcp.tool/ping"]
+    assert tool_spans, "Expected an mcp.tool/ping span"
+    attrs = tool_spans[0].attributes
+    assert attrs["mcp.client_kind"] == "oauth"
+    assert attrs["enduser.id"] == "keycloak-user-abc"
 
 
 def test_mcp_client_name_distinguishes_direct_connectors():

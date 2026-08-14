@@ -1,13 +1,20 @@
 import base64
 from unittest.mock import Mock, patch
 
+from fastmcp.server.auth import AccessToken
 from mcp.types import Implementation
 
 from cbioportal_mcp.telemetry import (
     _extract_mcp_client_info,
+    _extract_oauth_identity,
     _extract_session_id,
     _extract_user_identity,
+    _resolve_caller_identity,
 )
+
+
+def _access_token(**claims) -> AccessToken:
+    return AccessToken(token="fake-token", client_id="fake-client", scopes=[], claims=claims)
 
 
 def test_extracts_user_id_from_header():
@@ -98,3 +105,64 @@ def test_session_id_none_when_no_fastmcp_context():
     context = Mock()
     context.fastmcp_context = None
     assert _extract_session_id(context) is None
+
+
+def test_extracts_oauth_identity_from_access_token():
+    token = _access_token(sub="keycloak-user-abc", email="alice@example.org")
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=token):
+        user_id, user_email = _extract_oauth_identity()
+        assert user_id == "keycloak-user-abc"
+        assert user_email == "alice@example.org"
+
+
+def test_oauth_identity_none_when_no_access_token():
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=None):
+        user_id, user_email = _extract_oauth_identity()
+        assert user_id is None
+        assert user_email is None
+
+
+def test_oauth_identity_none_when_sub_claim_missing():
+    token = _access_token(email="alice@example.org")
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=token):
+        user_id, user_email = _extract_oauth_identity()
+        assert user_id is None
+        assert user_email == "alice@example.org"
+
+
+def test_resolve_caller_identity_prefers_oauth_over_header():
+    token = _access_token(sub="keycloak-user-abc", email="alice@example.org")
+    with (
+        patch("fastmcp.server.dependencies.get_access_token", return_value=token),
+        patch(
+            "fastmcp.server.dependencies.get_http_headers",
+            return_value={"x-user-id": "librechat-user-1"},
+        ),
+    ):
+        user_id, user_email, client = _resolve_caller_identity()
+        assert user_id == "keycloak-user-abc"
+        assert user_email == "alice@example.org"
+        assert client == "oauth"
+
+
+def test_resolve_caller_identity_falls_back_to_header_when_no_oauth_token():
+    with (
+        patch("fastmcp.server.dependencies.get_access_token", return_value=None),
+        patch(
+            "fastmcp.server.dependencies.get_http_headers",
+            return_value={"x-user-id": "librechat-user-1"},
+        ),
+    ):
+        user_id, user_email, client = _resolve_caller_identity()
+        assert user_id == "librechat-user-1"
+        assert client == "librechat"
+
+
+def test_resolve_caller_identity_direct_when_neither_present():
+    with (
+        patch("fastmcp.server.dependencies.get_access_token", return_value=None),
+        patch("fastmcp.server.dependencies.get_http_headers", return_value={}),
+    ):
+        user_id, user_email, client = _resolve_caller_identity()
+        assert user_id is None
+        assert client == "direct"
