@@ -911,8 +911,51 @@ WHERE cancer_study_identifier = '{study_id}'
 # Maximum allowed limit for list queries to prevent expensive unbounded queries
 MAX_LIST_LIMIT = 100
 
+
+@lru_cache(maxsize=128)
+def _list_studies_query(
+    search: str | None, limit: int, verbose: bool
+) -> tuple[tuple[tuple[str, object], ...], ...]:
+    """Return cached study rows for list_studies.
+
+    Use sample/patient for counts instead of clinical_data_derived. The latter
+    has many clinical-attribute rows per sample and makes first-connect study
+    discovery slower than it needs to be.
+    """
+    description_select = ",\n                    cs.description" if verbose else ""
+    description_group = ", cs.description" if verbose else ""
+
+    if search:
+        safe_search = _sanitize_search_term(search)
+        where_clause = f"""
+                WHERE cs.cancer_study_identifier ILIKE '%{safe_search}%'
+                    OR cs.name ILIKE '%{safe_search}%'
+                    OR cs.type_of_cancer_id ILIKE '%{safe_search}%'
+                    OR cs.description ILIKE '%{safe_search}%'
+        """
+    else:
+        where_clause = ""
+
+    query = f"""
+                SELECT
+                    cs.cancer_study_identifier,
+                    cs.name{description_select},
+                    cs.type_of_cancer_id,
+                    COUNT(DISTINCT s.internal_id) as sample_count
+                FROM cancer_study cs
+                LEFT JOIN patient p ON p.cancer_study_id = cs.cancer_study_id
+                LEFT JOIN sample s ON s.patient_id = p.internal_id
+                {where_clause}
+                GROUP BY cs.cancer_study_identifier, cs.name, cs.type_of_cancer_id{description_group}
+                ORDER BY sample_count DESC
+                LIMIT {limit}
+            """
+    rows = run_select_query(query)
+    return tuple(tuple(row.items()) for row in rows)
+
+
 @mcp.tool()
-def list_studies(search: str = None, limit: int = 20) -> list[dict]:
+def list_studies(search: str = None, limit: int = 20, verbose: bool = False) -> list[dict]:
     """List available cBioPortal studies.
 
     Studies with pre-generated guides (in resources/study-guides/) will have has_guide=True.
@@ -920,9 +963,11 @@ def list_studies(search: str = None, limit: int = 20) -> list[dict]:
     Args:
         search: Optional search term to filter studies by name, identifier, cancer type, or description
         limit: Maximum number of studies to return (default 20, max 100)
+        verbose: Include longer study description text. Defaults to false for faster first-connect discovery.
 
     Returns:
-        List of studies with their identifiers, names, descriptions, sample counts, and guide availability
+        List of studies with identifiers, names, cancer types, sample counts, and guide availability.
+        Descriptions are included only when verbose=true.
     """
     available_guides = set(_list_available_study_guides())
     
@@ -930,42 +975,8 @@ def list_studies(search: str = None, limit: int = 20) -> list[dict]:
     safe_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
     
     try:
-        if search:
-            # Sanitize search term to prevent SQL injection
-            safe_search = _sanitize_search_term(search)
-            query = f"""
-                SELECT
-                    cs.cancer_study_identifier,
-                    cs.name,
-                    cs.description,
-                    cs.type_of_cancer_id,
-                    COUNT(DISTINCT cd.sample_unique_id) as sample_count
-                FROM cancer_study cs
-                LEFT JOIN clinical_data_derived cd ON cs.cancer_study_identifier = cd.cancer_study_identifier
-                WHERE cs.cancer_study_identifier ILIKE '%{safe_search}%'
-                    OR cs.name ILIKE '%{safe_search}%'
-                    OR cs.type_of_cancer_id ILIKE '%{safe_search}%'
-                    OR cs.description ILIKE '%{safe_search}%'
-                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
-                ORDER BY sample_count DESC
-                LIMIT {safe_limit}
-            """
-        else:
-            query = f"""
-                SELECT
-                    cs.cancer_study_identifier,
-                    cs.name,
-                    cs.description,
-                    cs.type_of_cancer_id,
-                    COUNT(DISTINCT cd.sample_unique_id) as sample_count
-                FROM cancer_study cs
-                LEFT JOIN clinical_data_derived cd ON cs.cancer_study_identifier = cd.cancer_study_identifier
-                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
-                ORDER BY sample_count DESC
-                LIMIT {safe_limit}
-            """
-        
-        results = run_select_query(query)
+        cached_rows = _list_studies_query(search, safe_limit, bool(verbose))
+        results = [dict(row) for row in cached_rows]
         
         # Add has_guide field
         for study in results:
