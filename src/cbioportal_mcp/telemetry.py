@@ -6,19 +6,144 @@ import atexit
 import json
 import logging
 import os
-from typing import Any
+import socket
+import time
 
 import mcp.types as mt
-from fastmcp.server.middleware import Middleware, MiddlewareContext, CallNext
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 logger = logging.getLogger(__name__)
 
 _tracer_provider: TracerProvider | None = None
+_dogstatsd_client: "_DogStatsDClient | None" = None
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _sanitize_datadog_tag_value(value: object) -> str:
+    """Keep DogStatsD tags low-risk and parseable."""
+    text = str(value).strip().lower()
+    return "".join(ch if ch.isalnum() or ch in "._-/" else "_" for ch in text) or "unknown"
+
+
+class _DogStatsDClient:
+    """Minimal DogStatsD UDP client.
+
+    We only need counters and distributions, so using the wire protocol avoids
+    adding a dependency solely for a couple of metric packets per tool call.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        prefix: str = "cbioportal_mcp",
+        constant_tags: dict[str, object] | None = None,
+    ) -> None:
+        self._address = (host, port)
+        self._prefix = prefix.rstrip(".")
+        self._constant_tags = constant_tags or {}
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def increment(self, metric: str, tags: dict[str, object]) -> None:
+        self._send(metric, 1, "c", tags)
+
+    def distribution(self, metric: str, value: float, tags: dict[str, object]) -> None:
+        self._send(metric, value, "d", tags)
+
+    def _send(
+        self,
+        metric: str,
+        value: float | int,
+        metric_type: str,
+        tags: dict[str, object],
+    ) -> None:
+        full_metric = f"{self._prefix}.{metric}"
+        merged_tags = {**self._constant_tags, **tags}
+        tag_parts = [
+            f"{key}:{_sanitize_datadog_tag_value(value)}"
+            for key, value in sorted(merged_tags.items())
+            if value is not None
+        ]
+        tag_suffix = f"|#{','.join(tag_parts)}" if tag_parts else ""
+        packet = f"{full_metric}:{value}|{metric_type}{tag_suffix}"
+        self._socket.sendto(packet.encode("utf-8"), self._address)
+
+
+def _build_dogstatsd_client() -> _DogStatsDClient | None:
+    if not _env_flag("CBIOPORTAL_MCP_DD_METRICS_ENABLED", True):
+        return None
+
+    host = os.getenv("DD_DOGSTATSD_HOST") or os.getenv("DD_AGENT_HOST", "localhost")
+    port = int(os.getenv("DD_DOGSTATSD_PORT", "8125"))
+    prefix = os.getenv("CBIOPORTAL_MCP_DD_METRIC_PREFIX", "cbioportal_mcp")
+    service_name = os.getenv("DD_SERVICE") or os.getenv("OTEL_SERVICE_NAME", "cbioportal-mcp")
+    constant_tags: dict[str, object] = {"service": service_name}
+    if os.getenv("DD_ENV"):
+        constant_tags["env"] = os.getenv("DD_ENV")
+
+    return _DogStatsDClient(host, port, prefix=prefix, constant_tags=constant_tags)
+
+
+def dogstatsd_metrics_configured() -> bool:
+    """Return true when tool metrics should enable the telemetry middleware."""
+    if not _env_flag("CBIOPORTAL_MCP_DD_METRICS_ENABLED", True):
+        return False
+    return bool(
+        os.getenv("DD_AGENT_HOST")
+        or os.getenv("DD_DOGSTATSD_HOST")
+        or os.getenv("CBIOPORTAL_MCP_DD_METRICS_ENABLED")
+    )
+
+
+def _get_dogstatsd_client() -> _DogStatsDClient | None:
+    global _dogstatsd_client
+    if _dogstatsd_client is None:
+        try:
+            _dogstatsd_client = _build_dogstatsd_client()
+        except Exception as exc:
+            logger.debug("DogStatsD client setup failed: %s", exc)
+            _dogstatsd_client = None
+    return _dogstatsd_client
+
+
+def _emit_tool_metrics(
+    *,
+    tool_name: str,
+    duration_ms: float,
+    success: bool,
+    client_kind: str,
+    client_name: str | None,
+) -> None:
+    """Emit aggregate Datadog metrics for MCP tool call frequency and latency."""
+    client = _get_dogstatsd_client()
+    if client is None:
+        return
+
+    tags = {
+        "tool": tool_name,
+        "success": str(success).lower(),
+        "client_kind": client_kind,
+        "client_name": client_name,
+    }
+    try:
+        client.increment("tool.calls", tags)
+        client.distribution("tool.duration_ms", round(duration_ms, 3), tags)
+        if not success:
+            client.increment("tool.errors", tags)
+    except Exception as exc:
+        logger.debug("DogStatsD metric emit failed: %s", exc)
 
 
 def configure_telemetry() -> TracerProvider | None:
@@ -300,7 +425,10 @@ def _llmobs_finish(span, result, *, error: bool) -> None:
             try:
                 if hasattr(result, "content"):
                     output = json.dumps(
-                        [c.model_dump() if hasattr(c, "model_dump") else str(c) for c in result.content],
+                        [
+                            c.model_dump() if hasattr(c, "model_dump") else str(c)
+                            for c in result.content
+                        ],
                         default=str,
                     )
                 else:
@@ -378,6 +506,7 @@ class TelemetryMiddleware(Middleware):
             client_version,
             session_id,
         )
+        started = time.perf_counter()
 
         with self._tracer.start_as_current_span(f"mcp.tool/{tool_name}") as span:
             span.set_attribute("mcp.tool.name", tool_name)
@@ -403,12 +532,30 @@ class TelemetryMiddleware(Middleware):
 
             try:
                 result = await call_next(context)
+                duration_ms = (time.perf_counter() - started) * 1000
+                span.set_attribute("mcp.tool.duration_ms", duration_ms)
                 span.set_attribute("mcp.tool.success", True)
+                _emit_tool_metrics(
+                    tool_name=tool_name,
+                    duration_ms=duration_ms,
+                    success=True,
+                    client_kind=client,
+                    client_name=client_name,
+                )
                 _llmobs_finish(llmobs_span, result, error=False)
                 return result
             except Exception as exc:
+                duration_ms = (time.perf_counter() - started) * 1000
+                span.set_attribute("mcp.tool.duration_ms", duration_ms)
                 span.set_attribute("mcp.tool.success", False)
                 span.set_attribute("error.type", type(exc).__name__)
                 span.record_exception(exc)
+                _emit_tool_metrics(
+                    tool_name=tool_name,
+                    duration_ms=duration_ms,
+                    success=False,
+                    client_kind=client,
+                    client_name=client_name,
+                )
                 _llmobs_finish(llmobs_span, None, error=True)
                 raise

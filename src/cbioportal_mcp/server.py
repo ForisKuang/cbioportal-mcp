@@ -31,7 +31,11 @@ import mcp.types as mt
 from cbioportal_mcp.env import get_mcp_config, TransportType
 from cbioportal_mcp.authentication.permissions import ensure_db_permissions
 from cbioportal_mcp.auth import _build_auth_provider
-from cbioportal_mcp.telemetry import configure_telemetry, TelemetryMiddleware
+from cbioportal_mcp.telemetry import (
+    TelemetryMiddleware,
+    configure_telemetry,
+    dogstatsd_metrics_configured,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,9 +259,11 @@ def main():
         logger.critical("❌ ClickHouse permission check failed: %s", e)
         sys.exit(2)
 
-    # Set up OpenTelemetry → Datadog agent (no-op if env vars not set or agent unreachable)
+    # Set up OpenTelemetry → Datadog agent (no-op if env vars not set or agent unreachable).
+    # DogStatsD tool metrics can still use the same middleware when only the
+    # Datadog agent's UDP endpoint is configured.
     provider = configure_telemetry()
-    if provider is not None:
+    if provider is not None or dogstatsd_metrics_configured():
         mcp.add_middleware(TelemetryMiddleware())
 
     transport = config.mcp_server_transport

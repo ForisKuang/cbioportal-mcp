@@ -47,6 +47,37 @@ export CLICKHOUSE_MCP_SERVER_TRANSPORT=stdio # or http or sse
 # export CLICKHOUSE_MCP_HTTP_PATH=/db/mcp
 ```
 
+### Datadog Tool Metrics
+
+The server emits one OpenTelemetry span per MCP tool call and can also emit
+DogStatsD metrics for dashboard-level aggregates:
+
+| Metric | Type | Purpose |
+|---|---|---|
+| `cbioportal_mcp.tool.calls` | counter | Tool-call volume by `tool`, `success`, `client_kind`, and `client_name` |
+| `cbioportal_mcp.tool.duration_ms` | distribution | Tool latency, including p50/p95/p99 by tool |
+| `cbioportal_mcp.tool.errors` | counter | Tool-call failures by tool/client |
+
+DogStatsD metrics are enabled by default when `DD_AGENT_HOST` or
+`DD_DOGSTATSD_HOST` is configured:
+
+```bash
+export DD_AGENT_HOST=<datadog-agent-host>
+# Optional overrides:
+export DD_DOGSTATSD_HOST=<dogstatsd-host>
+export DD_DOGSTATSD_PORT=8125
+export DD_SERVICE=cbioportal-mcp
+export DD_ENV=prod
+export CBIOPORTAL_MCP_DD_METRICS_ENABLED=true
+export CBIOPORTAL_MCP_DD_METRIC_PREFIX=cbioportal_mcp
+```
+
+Set `CBIOPORTAL_MCP_DD_METRICS_ENABLED=false` to disable DogStatsD metrics.
+The checked-in dashboard definition at
+[`datadog/cbioagent-tool-metrics-dashboard.json`](datadog/cbioagent-tool-metrics-dashboard.json)
+can be imported into Datadog or used as the source for updating the existing
+cBioAgent dashboard.
+
 ## Preparing the database
 
 **We strongly recommend pointing the MCP at a *separate* ClickHouse database, not your production cBioPortal database directly.** Two reasons:
