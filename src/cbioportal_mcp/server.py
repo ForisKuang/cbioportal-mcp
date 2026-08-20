@@ -82,24 +82,6 @@ def _validate_table_name(table: str) -> str:
         )
     return table
 
-def _sanitize_search_term(search: str) -> str:
-    """Sanitize a search term by escaping SQL special characters.
-    
-    Args:
-        search: The search term to sanitize
-        
-    Returns:
-        The sanitized search term safe for use in LIKE clauses
-    """
-    if not search:
-        return ""
-    # Escape single quotes by doubling them (SQL standard)
-    # Also escape % and _ which are LIKE wildcards
-    sanitized = search.replace("'", "''")
-    sanitized = sanitized.replace("%", "\\%")
-    sanitized = sanitized.replace("_", "\\_")
-    return sanitized
-
 # Resource loading using importlib.resources for proper package support
 def _get_resources_path() -> Path:
     """Get the resources directory path, supporting both installed packages and dev mode."""
@@ -912,46 +894,59 @@ WHERE cancer_study_identifier = '{study_id}'
 MAX_LIST_LIMIT = 100
 
 
-@lru_cache(maxsize=128)
-def _list_studies_query(
-    search: str | None, limit: int, verbose: bool
-) -> tuple[tuple[tuple[str, object], ...], ...]:
-    """Return cached study rows for list_studies.
+@lru_cache(maxsize=1)
+def _all_studies_query() -> tuple[tuple[tuple[str, object], ...], ...]:
+    """Return every study's full detail, cached once for the process lifetime.
+
+    Mirrors cbioportal's own /api/studies?projection=DETAILED, which caches
+    the entire study list rather than one entry per distinct query shape.
+    list_studies() filters this single snapshot in Python by search/limit/
+    verbose, so every call is a cache hit after the first regardless of the
+    search term used.
 
     Use sample/patient for counts instead of clinical_data_derived. The latter
     has many clinical-attribute rows per sample and makes first-connect study
     discovery slower than it needs to be.
     """
-    description_select = ",\n                    cs.description" if verbose else ""
-    description_group = ", cs.description" if verbose else ""
-
-    if search:
-        safe_search = _sanitize_search_term(search)
-        where_clause = f"""
-                WHERE cs.cancer_study_identifier ILIKE '%{safe_search}%'
-                    OR cs.name ILIKE '%{safe_search}%'
-                    OR cs.type_of_cancer_id ILIKE '%{safe_search}%'
-                    OR cs.description ILIKE '%{safe_search}%'
-        """
-    else:
-        where_clause = ""
-
-    query = f"""
+    query = """
                 SELECT
                     cs.cancer_study_identifier,
-                    cs.name{description_select},
+                    cs.name,
+                    cs.description,
                     cs.type_of_cancer_id,
                     COUNT(DISTINCT s.internal_id) as sample_count
                 FROM cancer_study cs
                 LEFT JOIN patient p ON p.cancer_study_id = cs.cancer_study_id
                 LEFT JOIN sample s ON s.patient_id = p.internal_id
-                {where_clause}
-                GROUP BY cs.cancer_study_identifier, cs.name, cs.type_of_cancer_id{description_group}
+                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
                 ORDER BY sample_count DESC
-                LIMIT {limit}
             """
     rows = run_select_query(query)
     return tuple(tuple(row.items()) for row in rows)
+
+
+def _filter_studies(search: str | None, limit: int, verbose: bool) -> list[dict]:
+    """Filter, limit, and shape the cached full study list for list_studies()."""
+    rows = [dict(row) for row in _all_studies_query()]
+
+    if search:
+        needle = search.lower()
+        rows = [
+            row
+            for row in rows
+            if needle in row["cancer_study_identifier"].lower()
+            or needle in row["name"].lower()
+            or needle in row["type_of_cancer_id"].lower()
+            or needle in (row["description"] or "").lower()
+        ]
+
+    rows = rows[:limit]
+
+    if not verbose:
+        for row in rows:
+            row.pop("description", None)
+
+    return rows
 
 
 @mcp.tool()
@@ -975,9 +970,8 @@ def list_studies(search: str = None, limit: int = 20, verbose: bool = False) -> 
     safe_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
     
     try:
-        cached_rows = _list_studies_query(search, safe_limit, bool(verbose))
-        results = [dict(row) for row in cached_rows]
-        
+        results = _filter_studies(search, safe_limit, bool(verbose))
+
         # Add has_guide field
         for study in results:
             study_id = study.get('cancer_study_identifier', '')
