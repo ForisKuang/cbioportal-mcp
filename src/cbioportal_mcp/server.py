@@ -237,6 +237,15 @@ def main():
         logger.critical("❌ ClickHouse permission check failed: %s", e)
         sys.exit(2)
 
+    # Pre-warm the list_studies cache so the first real client request
+    # doesn't pay the ClickHouse round trip _all_studies_query() would
+    # otherwise incur on first use. Best-effort: a failure here just means
+    # the cache stays cold and warms lazily on first use, same as before.
+    try:
+        _all_studies_query()
+    except Exception as e:
+        logger.warning(f"Failed to pre-warm list_studies cache: {e}")
+
     # Set up OpenTelemetry → Datadog agent (no-op if env vars not set or agent unreachable)
     provider = configure_telemetry()
     if provider is not None:
