@@ -20,7 +20,7 @@ def test_list_studies_default_uses_trimmed_sample_count_query(monkeypatch):
         queries.append(query)
         return _fake_rows()
 
-    server._all_studies_query.cache_clear()
+    server._clear_studies_cache()
     monkeypatch.setattr(server, "_list_available_study_guides", lambda: [])
     monkeypatch.setattr(server, "run_select_query", fake_run_select_query)
 
@@ -33,6 +33,34 @@ def test_list_studies_default_uses_trimmed_sample_count_query(monkeypatch):
     assert "LEFT JOIN patient" in queries[0]
 
 
+def test_list_studies_refetches_after_ttl_expires(monkeypatch):
+    call_count = 0
+
+    def fake_run_select_query(query):
+        nonlocal call_count
+        call_count += 1
+        return _fake_rows()
+
+    fake_now = [1000.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: fake_now[0])
+    monkeypatch.setattr(server, "STUDIES_CACHE_TTL_SECONDS", 900)
+
+    server._clear_studies_cache()
+    monkeypatch.setattr(server, "_list_available_study_guides", lambda: [])
+    monkeypatch.setattr(server, "run_select_query", fake_run_select_query)
+
+    server.list_studies.fn()
+    assert call_count == 1
+
+    fake_now[0] += 899  # still within TTL
+    server.list_studies.fn()
+    assert call_count == 1
+
+    fake_now[0] += 2  # past TTL
+    server.list_studies.fn()
+    assert call_count == 2
+
+
 def test_list_studies_caches_repeated_calls_across_search_terms(monkeypatch):
     call_count = 0
 
@@ -41,7 +69,7 @@ def test_list_studies_caches_repeated_calls_across_search_terms(monkeypatch):
         call_count += 1
         return _fake_rows()
 
-    server._all_studies_query.cache_clear()
+    server._clear_studies_cache()
     monkeypatch.setattr(server, "_list_available_study_guides", lambda: [])
     monkeypatch.setattr(server, "run_select_query", fake_run_select_query)
 
@@ -59,7 +87,7 @@ def test_list_studies_verbose_includes_description(monkeypatch):
         queries.append(query)
         return _fake_rows()
 
-    server._all_studies_query.cache_clear()
+    server._clear_studies_cache()
     monkeypatch.setattr(server, "_list_available_study_guides", lambda: [])
     monkeypatch.setattr(server, "run_select_query", fake_run_select_query)
 
@@ -88,7 +116,7 @@ def test_list_studies_search_filters_in_python(monkeypatch):
             },
         ]
 
-    server._all_studies_query.cache_clear()
+    server._clear_studies_cache()
     monkeypatch.setattr(server, "_list_available_study_guides", lambda: [])
     monkeypatch.setattr(server, "run_select_query", fake_run_select_query)
 

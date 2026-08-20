@@ -19,6 +19,8 @@ import json
 import logging
 import re
 import sys
+import threading
+import time
 from functools import lru_cache
 from importlib import resources as importlib_resources
 from pathlib import Path
@@ -237,14 +239,17 @@ def main():
         logger.critical("❌ ClickHouse permission check failed: %s", e)
         sys.exit(2)
 
-    # Pre-warm the list_studies cache so the first real client request
-    # doesn't pay the ClickHouse round trip _all_studies_query() would
-    # otherwise incur on first use. Best-effort: a failure here just means
-    # the cache stays cold and warms lazily on first use, same as before.
-    try:
-        _all_studies_query()
-    except Exception as e:
-        logger.warning(f"Failed to pre-warm list_studies cache: {e}")
+    # Warm the list_studies cache in the background so most early callers get
+    # a warm cache without blocking server startup on the ClickHouse round
+    # trip. Best-effort and fire-and-forget: a failure here just means the
+    # cache warms lazily on first real use instead, same as before this ran.
+    def _warm_studies_cache():
+        try:
+            _all_studies_query()
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm list_studies cache: {e}")
+
+    threading.Thread(target=_warm_studies_cache, daemon=True).start()
 
     # Set up OpenTelemetry → Datadog agent (no-op if env vars not set or agent unreachable)
     provider = configure_telemetry()
@@ -903,35 +908,68 @@ WHERE cancer_study_identifier = '{study_id}'
 MAX_LIST_LIMIT = 100
 
 
-@lru_cache(maxsize=1)
+# How long a cached study snapshot is served before the next call refetches it.
+# The underlying data only changes via the daily clone job, so this just bounds
+# how long a study add/remove can take to become visible without a restart.
+STUDIES_CACHE_TTL_SECONDS = 900
+
+_studies_cache_lock = threading.Lock()
+_studies_cache_rows: tuple[tuple[tuple[str, object], ...], ...] | None = None
+_studies_cache_fetched_at: float = 0.0
+
+
+def _clear_studies_cache() -> None:
+    """Reset the cached study snapshot. Test hook; not used at runtime."""
+    global _studies_cache_rows, _studies_cache_fetched_at
+    with _studies_cache_lock:
+        _studies_cache_rows = None
+        _studies_cache_fetched_at = 0.0
+
+
 def _all_studies_query() -> tuple[tuple[tuple[str, object], ...], ...]:
-    """Return every study's full detail, cached once for the process lifetime.
+    """Return every study's full detail, refetched at most every
+    STUDIES_CACHE_TTL_SECONDS.
 
     Mirrors cbioportal's own /api/studies?projection=DETAILED, which caches
     the entire study list rather than one entry per distinct query shape.
     list_studies() filters this single snapshot in Python by search/limit/
-    verbose, so every call is a cache hit after the first regardless of the
-    search term used.
+    verbose, so every call is a cache hit regardless of the search term used,
+    except for the one caller per TTL window that pays the refetch.
 
     Use sample/patient for counts instead of clinical_data_derived. The latter
     has many clinical-attribute rows per sample and makes first-connect study
     discovery slower than it needs to be.
+
+    Holds the lock across the refetch (not just the cache read) so concurrent
+    callers past TTL expiry queue behind one refresh instead of each firing
+    their own identical ClickHouse query.
     """
-    query = """
-                SELECT
-                    cs.cancer_study_identifier,
-                    cs.name,
-                    cs.description,
-                    cs.type_of_cancer_id,
-                    COUNT(DISTINCT s.internal_id) as sample_count
-                FROM cancer_study cs
-                LEFT JOIN patient p ON p.cancer_study_id = cs.cancer_study_id
-                LEFT JOIN sample s ON s.patient_id = p.internal_id
-                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
-                ORDER BY sample_count DESC
-            """
-    rows = run_select_query(query)
-    return tuple(tuple(row.items()) for row in rows)
+    global _studies_cache_rows, _studies_cache_fetched_at
+    with _studies_cache_lock:
+        now = time.monotonic()
+        if (
+            _studies_cache_rows is not None
+            and (now - _studies_cache_fetched_at) < STUDIES_CACHE_TTL_SECONDS
+        ):
+            return _studies_cache_rows
+
+        query = """
+                    SELECT
+                        cs.cancer_study_identifier,
+                        cs.name,
+                        cs.description,
+                        cs.type_of_cancer_id,
+                        COUNT(DISTINCT s.internal_id) as sample_count
+                    FROM cancer_study cs
+                    LEFT JOIN patient p ON p.cancer_study_id = cs.cancer_study_id
+                    LEFT JOIN sample s ON s.patient_id = p.internal_id
+                    GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
+                    ORDER BY sample_count DESC
+                """
+        rows = run_select_query(query)
+        _studies_cache_rows = tuple(tuple(row.items()) for row in rows)
+        _studies_cache_fetched_at = now
+        return _studies_cache_rows
 
 
 def _filter_studies(search: str | None, limit: int, verbose: bool) -> list[dict]:
