@@ -47,6 +47,26 @@ export CLICKHOUSE_MCP_SERVER_TRANSPORT=stdio # or http or sse
 # export CLICKHOUSE_MCP_HTTP_PATH=/db/mcp
 ```
 
+### Client-Side Prompt Caching
+
+This server's `instructions` block (`resources/system-prompt.md`) and tool
+schemas are static per image version — they don't embed timestamps, request
+IDs, or other per-call content — so they're safe to cache on the LLM-client
+side (e.g. an
+[Anthropic `cache_control` breakpoint](https://docs.claude.com/en/docs/build-with-claude/prompt-caching)
+placed after the system prompt and tool definitions). The same is true of
+guide content returned by `read_guide()`: it's baked into the image and
+identical across calls until the next deploy.
+
+Caching itself is configured by whatever MCP client/host is talking to the
+LLM (Claude Code, Claude Desktop, a custom agent loop, etc.) — this server
+has no visibility into or control over it, since it only serves tool/resource
+content over MCP. If you operate an MCP client against this server, confirm
+prompt caching is enabled there for the biggest token-cost win; there's
+nothing to configure on this server's side beyond keeping the always-loaded
+instructions and tool descriptions free of per-request dynamic content, which
+they are today.
+
 ### Datadog Tool Metrics
 
 The server emits one OpenTelemetry span per MCP tool call and can also emit
