@@ -8,6 +8,7 @@ import logging
 import os
 import socket
 import time
+from contextlib import contextmanager
 
 import mcp.types as mt
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -144,6 +145,59 @@ def _emit_tool_metrics(
             client.increment("tool.errors", tags)
     except Exception as exc:
         logger.debug("DogStatsD metric emit failed: %s", exc)
+
+
+def _emit_db_query_metrics(
+    *,
+    query_label: str,
+    duration_ms: float,
+    success: bool,
+) -> None:
+    """Emit aggregate Datadog metrics for one ClickHouse SELECT, tagged by call
+    site. run_select_query() is a single funnel for every SELECT the server
+    runs; without a per-call-site tag its latency metric averages together a
+    cheap primary-key lookup and an expensive multi-table aggregate, hiding
+    which one actually needs attention."""
+    client = _get_dogstatsd_client()
+    if client is None:
+        return
+
+    tags = {"query_label": query_label, "success": str(success).lower()}
+    try:
+        client.increment("db_query.calls", tags)
+        client.distribution("db_query.duration_ms", round(duration_ms, 3), tags)
+        if not success:
+            client.increment("db_query.errors", tags)
+    except Exception as exc:
+        logger.debug("DogStatsD db_query metric emit failed: %s", exc)
+
+
+@contextmanager
+def traced_db_query(query_label: str):
+    """Wrap one ClickHouse SELECT with an OTel span (``db.query/<label>``) and
+    a Datadog distribution metric, both tagged by query_label so latency can
+    be broken down by call site in Datadog instead of averaged into one
+    run_select_query number. Re-raises on failure after recording it as a
+    failed call; does not suppress or alter the underlying exception.
+    """
+    tracer = trace.get_tracer(__name__)
+    started = time.perf_counter()
+    with tracer.start_as_current_span(f"db.query/{query_label}") as span:
+        span.set_attribute("db.query.label", query_label)
+        try:
+            yield
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - started) * 1000
+            span.set_attribute("db.query.duration_ms", duration_ms)
+            span.set_attribute("db.query.success", False)
+            span.set_attribute("error.type", type(exc).__name__)
+            _emit_db_query_metrics(query_label=query_label, duration_ms=duration_ms, success=False)
+            raise
+        else:
+            duration_ms = (time.perf_counter() - started) * 1000
+            span.set_attribute("db.query.duration_ms", duration_ms)
+            span.set_attribute("db.query.success", True)
+            _emit_db_query_metrics(query_label=query_label, duration_ms=duration_ms, success=True)
 
 
 def configure_telemetry() -> TracerProvider | None:
