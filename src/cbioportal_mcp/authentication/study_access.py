@@ -10,6 +10,7 @@ the arbitrary ClickHouse SELECT tool.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import logging
 import re
@@ -92,6 +93,10 @@ STUDY_AGNOSTIC_REFERENCE_TABLES = frozenset(
 
 class AuthorizationError(PermissionError):
     """Raised when the current request is not authorized for a study/query."""
+
+
+class StudyAccessConfigError(ValueError):
+    """Raised when the current study-access configuration is unsafe to start with."""
 
 
 @dataclass(frozen=True)
@@ -213,8 +218,8 @@ def _verify_proxy_secret(config: McpConfig) -> None:
     except Exception:
         headers = {}
 
-    actual = headers.get(config.auth_proxy_secret_header)
-    if actual != expected:
+    actual = headers.get(config.auth_proxy_secret_header) or ""
+    if not hmac.compare_digest(actual, expected):
         raise AuthorizationError("Request did not include the expected trusted-proxy secret.")
 
 
@@ -296,6 +301,47 @@ def get_current_study_access(config: McpConfig | None = None) -> StudyAccess:
     if "*" in validated:
         return StudyAccess(identity=identity, all_studies=True, studies=frozenset())
     return StudyAccess(identity=identity, all_studies=False, studies=frozenset(validated))
+
+
+def validate_study_access_startup_config(config: McpConfig | None = None) -> None:
+    """Fail closed on unsafe restricted-mode config; warn on the weaker (heuristic-only) mode.
+
+    Restricted mode trusts identity/allowlist headers (``x-user-id``,
+    ``x-forwarded-groups``, ``x-cbioportal-allowed-studies``) on the sole
+    assumption that they were set by a trusted reverse proxy, not forged by
+    whoever can reach this process. ``CBIOPORTAL_MCP_AUTH_PROXY_SECRET`` is
+    the only thing that lets the server verify that assumption instead of
+    just trusting the network topology; without it, anyone who can reach the
+    server directly (a misconfigured network policy, same-cluster traffic, a
+    debug port-forward) can set those headers themselves and skip
+    authentication entirely. Refuse to start rather than silently accept
+    that.
+    """
+    config = config or get_mcp_config()
+    if config.study_access_mode != StudyAccessMode.RESTRICTED.value:
+        return
+
+    if not config.auth_proxy_secret:
+        raise StudyAccessConfigError(
+            "CBIOPORTAL_MCP_STUDY_ACCESS_MODE=restricted requires "
+            "CBIOPORTAL_MCP_AUTH_PROXY_SECRET to be set. Without it, this server has no way "
+            "to verify that x-user-id / x-forwarded-groups / x-cbioportal-allowed-studies "
+            "headers actually came from your trusted auth proxy rather than a direct caller "
+            "who can reach this server on the network - restricted mode would be enforcing "
+            "access decisions against headers anyone could set themselves. Configure a shared "
+            "secret known only to the proxy (see local_keycloak_proxy.py for the reference "
+            "implementation), or run in public mode instead."
+        )
+
+    if not config.clickhouse_row_policy_enabled:
+        logger.warning(
+            "CBIOPORTAL_MCP_STUDY_ACCESS_MODE=restricted is running without "
+            "CBIOPORTAL_MCP_CLICKHOUSE_ROW_POLICY_ENABLED=true. Study access is enforced only "
+            "by the app-level SQL guard, a heuristic pattern check on arbitrary SELECT queries "
+            "rather than a real SQL parser - not by ClickHouse row policies. This is the "
+            "documented, weaker mode; enable row-policy enforcement for real defense-in-depth "
+            "isolation, especially before exposing the arbitrary-SQL tool."
+        )
 
 
 def quote_sql_string(value: str) -> str:

@@ -31,11 +31,13 @@ from cbioportal_mcp.env import get_mcp_config, TransportType
 from cbioportal_mcp.authentication.permissions import ensure_db_permissions
 from cbioportal_mcp.authentication.study_access import (
     AuthorizationError,
+    StudyAccessConfigError,
     authorize_study,
     clickhouse_study_access_settings,
     get_current_study_access as resolve_current_study_access,
     guard_query_study_access,
     study_access_condition,
+    validate_study_access_startup_config,
 )
 from cbioportal_mcp.telemetry import configure_telemetry, TelemetryMiddleware
 
@@ -232,6 +234,12 @@ def main():
 
     # Get config
     config = get_mcp_config()
+
+    try:
+        validate_study_access_startup_config(config=config)
+    except StudyAccessConfigError as e:
+        logger.critical("❌ Study access configuration is unsafe to start with: %s", e)
+        sys.exit(2)
 
     try:
         ensure_db_permissions(config=config)

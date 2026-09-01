@@ -6,8 +6,10 @@ import pytest
 
 from cbioportal_mcp.authentication.study_access import (
     AuthorizationError,
+    StudyAccessConfigError,
     get_current_study_access,
     guard_query_study_access,
+    validate_study_access_startup_config,
 )
 from cbioportal_mcp.env import McpConfig
 
@@ -193,3 +195,76 @@ def test_restricted_query_rejects_boolean_bypass_shape(monkeypatch):
             "WHERE cancer_study_identifier = 'study_a' OR 1 = 1",
             McpConfig(),
         )
+
+
+def test_proxy_secret_rejects_missing_header(monkeypatch):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_PROXY_SECRET", "s3cr3t")
+
+    with _headers({"x-user-id": "user-1"}), pytest.raises(
+        AuthorizationError, match="trusted-proxy secret"
+    ):
+        get_current_study_access(McpConfig())
+
+
+def test_proxy_secret_rejects_wrong_value(monkeypatch):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_PROXY_SECRET", "s3cr3t")
+
+    with _headers(
+        {"x-user-id": "user-1", "x-cbioportal-mcp-proxy-secret": "wrong"}
+    ), pytest.raises(AuthorizationError, match="trusted-proxy secret"):
+        get_current_study_access(McpConfig())
+
+
+def test_proxy_secret_accepts_matching_value(monkeypatch):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_PROXY_SECRET", "s3cr3t")
+
+    with _headers(
+        {
+            "x-user-id": "user-1",
+            "x-cbioportal-mcp-proxy-secret": "s3cr3t",
+            "x-cbioportal-allowed-studies": "study_a",
+        }
+    ):
+        access = get_current_study_access(McpConfig())
+
+    assert access.studies == {"study_a"}
+
+
+def test_startup_config_rejects_restricted_mode_without_proxy_secret(monkeypatch):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.delenv("CBIOPORTAL_MCP_AUTH_PROXY_SECRET", raising=False)
+
+    with pytest.raises(StudyAccessConfigError, match="CBIOPORTAL_MCP_AUTH_PROXY_SECRET"):
+        validate_study_access_startup_config(McpConfig())
+
+
+def test_startup_config_allows_public_mode_without_proxy_secret(monkeypatch):
+    monkeypatch.delenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", raising=False)
+    monkeypatch.delenv("CBIOPORTAL_MCP_AUTH_PROXY_SECRET", raising=False)
+
+    validate_study_access_startup_config(McpConfig())
+
+
+def test_startup_config_warns_when_row_policies_disabled(monkeypatch, caplog):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_PROXY_SECRET", "s3cr3t")
+    monkeypatch.delenv("CBIOPORTAL_MCP_CLICKHOUSE_ROW_POLICY_ENABLED", raising=False)
+
+    with caplog.at_level("WARNING"):
+        validate_study_access_startup_config(McpConfig())
+
+    assert any("row-policy" in record.message.lower() for record in caplog.records)
+
+
+def test_startup_config_no_warning_when_row_policies_enabled(monkeypatch, caplog):
+    monkeypatch.setenv("CBIOPORTAL_MCP_STUDY_ACCESS_MODE", "restricted")
+    monkeypatch.setenv("CBIOPORTAL_MCP_AUTH_PROXY_SECRET", "s3cr3t")
+    monkeypatch.setenv("CBIOPORTAL_MCP_CLICKHOUSE_ROW_POLICY_ENABLED", "true")
+
+    with caplog.at_level("WARNING"):
+        validate_study_access_startup_config(McpConfig())
+
+    assert not caplog.records

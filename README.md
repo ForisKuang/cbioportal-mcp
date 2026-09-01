@@ -60,6 +60,7 @@ Internal deployments can enable per-request study authorization:
 ```bash
 export CBIOPORTAL_MCP_STUDY_ACCESS_MODE=restricted
 export CBIOPORTAL_MCP_AUTH_REQUIRED=true
+export CBIOPORTAL_MCP_AUTH_PROXY_SECRET=shared-secret-known-only-to-the-proxy
 ```
 
 The MCP server expects authentication to be handled by a trusted reverse proxy
@@ -95,10 +96,16 @@ export CBIOPORTAL_MCP_STUDY_ACL_FILE=/etc/cbioportal-mcp/study-acl.json
 }
 ```
 
-Optional hardening for header-based auth:
+`CBIOPORTAL_MCP_AUTH_PROXY_SECRET` (set above) is **required** in restricted
+mode, not optional: it is the only thing that lets the server verify that
+`x-user-id` / `x-forwarded-groups` / `x-cbioportal-allowed-studies` actually
+came from your trusted proxy rather than a direct caller who can reach this
+process on the network. The server refuses to start in restricted mode
+without it (`validate_study_access_startup_config`, called from `main()`)
+rather than silently trusting unverified headers. Only the header name
+carrying the secret is configurable:
 
 ```bash
-export CBIOPORTAL_MCP_AUTH_PROXY_SECRET=shared-secret-known-only-to-the-proxy
 # optional; default is x-cbioportal-mcp-proxy-secret
 export CBIOPORTAL_MCP_AUTH_PROXY_SECRET_HEADER=x-cbioportal-mcp-proxy-secret
 ```
@@ -127,7 +134,10 @@ column (e.g. `clinical_event_data`, which only has `clinical_event_id`, itself
 resolved through `clinical_event.patient_id` -> `patient.cancer_study_identifier`).
 This is the recommended defense-in-depth mode for restricted deployments; the
 app-level guard still rejects explicit requests for denied study IDs and blocks
-attempts to set the internal allowlist setting in user SQL.
+attempts to set the internal allowlist setting in user SQL. Running restricted
+mode without it logs a startup warning: the app-level guard is a heuristic
+pattern check on arbitrary SELECT queries, not a real SQL parser, so it's the
+weaker of the two supported modes.
 
 Per-table grants (no wildcard) would mechanically close the "forgotten
 table" gap on their own - ClickHouse just denies an ungranted table
