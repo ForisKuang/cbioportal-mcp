@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from importlib import resources as importlib_resources
 from pathlib import Path
@@ -37,6 +38,7 @@ from cbioportal_mcp.telemetry import (
     TelemetryMiddleware,
     configure_telemetry,
     dogstatsd_metrics_configured,
+    traced_db_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -402,7 +404,7 @@ def study_resolution_guide() -> str:
 )
 def clickhouse_run_select_query(query: str) -> dict[str, list[dict] | str]:
     try:
-        result = run_select_query(query)
+        result = run_select_query(query, query_label="clickhouse_run_select_query")
         logger.debug(f"clickhouse_run_select_query returns {result}")
         return {"rows": result}
     except Exception as e:
@@ -480,12 +482,20 @@ def clickhouse_list_table_columns(table: str) -> dict[str, list[dict] | str]:
         return {"error_message": error_message}
 
 
-def run_select_query(query: str) -> list[dict]:
+def run_select_query(query: str, *, query_label: str) -> list[dict]:
     """
     Execute arbitrary ClickHouse SQL SELECT query.
-    
+
     Note: CTEs (WITH ... AS) are supported. Query validation is handled at the
     database level via read-only user permissions (see authentication/permissions.py).
+
+    Args:
+        query_label: Identifies the call site for telemetry (a Datadog span +
+            metric tag), e.g. "study_guide.counts". run_select_query() is a
+            single funnel for every SELECT this server runs, so without a
+            per-call-site label its own latency metric would average a cheap
+            lookup together with an expensive multi-table aggregate. Use
+            "area.purpose", not the raw SQL text.
 
     Returns:
         list: A list of rows, where each row is a dictionary with column names as keys and corresponding values.
@@ -495,8 +505,9 @@ def run_select_query(query: str) -> list[dict]:
     # DB-level read-only permissions (enforced on startup) prevent non-SELECT queries,
     # so we don't need application-level query filtering. This allows CTEs (WITH ... AS).
     logger.debug("run_select_query: delegate the query to run_select_query tool of ClickHouse MCP")
-    ch_query_result = run_select_query(query)
-    result = zip_select_query_result(ch_query_result)
+    with traced_db_query(query_label):
+        ch_query_result = run_select_query(query)
+        result = zip_select_query_result(ch_query_result)
     return result
 
 
@@ -664,7 +675,7 @@ def _similar_study_identifiers(study_id: str, limit: int = 10) -> list[dict]:
             FROM cancer_study
             WHERE {clauses}
             LIMIT {int(limit)}
-        """) or []
+        """, query_label="similar_study_identifiers") or []
     except Exception as e:
         logger.error(f"Error looking up studies similar to {study_id}: {e}")
         return []
@@ -759,7 +770,7 @@ def get_study_guide(study_id: str) -> str:
                 type_of_cancer_id
             FROM cancer_study
             WHERE lower(cancer_study_identifier) = lower('{study_id}')
-        """)
+        """, query_label="study_guide.study_info")
 
         if not study_info:
             return _study_not_in_deployment_message(study_id)
@@ -774,15 +785,95 @@ def get_study_guide(study_id: str) -> str:
 **Cancer Type:** {info.get('type_of_cancer_id', 'N/A')}
 **Description:** {info.get('description', 'N/A')}
 """)
-        
-        # 2. Patient and sample counts
-        counts = run_select_query(f"""
-            SELECT 
-                COUNT(DISTINCT patient_unique_id) as patient_count,
-                COUNT(DISTINCT sample_unique_id) as sample_count
-            FROM clinical_data_derived 
-            WHERE cancer_study_identifier = '{study_id}'
-        """)
+
+        # Sections 2-7 below only depend on study_id, not on each other or on
+        # section order, so they're fired concurrently here instead of one
+        # ClickHouse round trip at a time -- each pays the same fixed
+        # per-call connection overhead (see run_select_query), so six
+        # sequential calls cost roughly six times that overhead in wall
+        # clock, while six concurrent ones cost roughly one. Results are
+        # still consumed in the original section order below, so the guide's
+        # output is unchanged regardless of which query finishes first.
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            counts_future = executor.submit(
+                run_select_query,
+                f"""
+                    SELECT
+                        COUNT(DISTINCT patient_unique_id) as patient_count,
+                        COUNT(DISTINCT sample_unique_id) as sample_count
+                    FROM clinical_data_derived
+                    WHERE cancer_study_identifier = '{study_id}'
+                """,
+                query_label="study_guide.counts",
+            )
+            profiles_future = executor.submit(
+                run_select_query,
+                f"""
+                    SELECT DISTINCT
+                        gp.genetic_alteration_type,
+                        gp.datatype,
+                        gp.name
+                    FROM genetic_profile gp
+                    JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
+                    WHERE cs.cancer_study_identifier = '{study_id}'
+                """,
+                query_label="study_guide.profiles",
+            )
+            panels_future = executor.submit(
+                run_select_query,
+                f"""
+                    SELECT DISTINCT gene_panel_id, COUNT(DISTINCT sample_unique_id) as sample_count
+                    FROM sample_to_gene_panel_derived
+                    WHERE cancer_study_identifier = '{study_id}'
+                    GROUP BY gene_panel_id
+                    ORDER BY sample_count DESC
+                    LIMIT 10
+                """,
+                query_label="study_guide.panels",
+            )
+            attrs_future = executor.submit(
+                run_select_query,
+                f"""
+                    SELECT DISTINCT attribute_name, COUNT(DISTINCT sample_unique_id) as coverage
+                    FROM clinical_data_derived
+                    WHERE cancer_study_identifier = '{study_id}'
+                    GROUP BY attribute_name
+                    ORDER BY coverage DESC
+                    LIMIT 20
+                """,
+                query_label="study_guide.attrs",
+            )
+            top_genes_future = executor.submit(
+                run_select_query,
+                f"""
+                    SELECT
+                        hugo_gene_symbol,
+                        COUNT(DISTINCT sample_unique_id) as altered_samples
+                    FROM genomic_event_derived
+                    WHERE cancer_study_identifier = '{study_id}'
+                        AND variant_type = 'mutation'
+                        AND mutation_status != 'UNCALLED'
+                    GROUP BY hugo_gene_symbol
+                    ORDER BY altered_samples DESC
+                    LIMIT 10
+                """,
+                query_label="study_guide.top_genes",
+            )
+            sample_types_future = executor.submit(
+                run_select_query,
+                f"""
+                    SELECT attribute_value as sample_type, COUNT(DISTINCT sample_unique_id) as count
+                    FROM clinical_data_derived
+                    WHERE cancer_study_identifier = '{study_id}'
+                        AND attribute_name = 'SAMPLE_TYPE'
+                    GROUP BY attribute_value
+                    ORDER BY count DESC
+                """,
+                query_label="study_guide.sample_types",
+            )
+
+            # 2. Patient and sample counts
+            counts = counts_future.result()
         if counts:
             c = counts[0]
             guide_sections.append(f"""## Cohort Statistics
@@ -791,15 +882,7 @@ def get_study_guide(study_id: str) -> str:
 """)
         
         # 3. Available data types
-        profiles = run_select_query(f"""
-            SELECT DISTINCT 
-                gp.genetic_alteration_type,
-                gp.datatype,
-                gp.name
-            FROM genetic_profile gp
-            JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
-            WHERE cs.cancer_study_identifier = '{study_id}'
-        """)
+        profiles = profiles_future.result()
         if profiles:
             guide_sections.append("## Available Data Types\n")
             for p in profiles:
@@ -807,14 +890,7 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 4. Gene panels used
-        panels = run_select_query(f"""
-            SELECT DISTINCT gene_panel_id, COUNT(DISTINCT sample_unique_id) as sample_count
-            FROM sample_to_gene_panel_derived
-            WHERE cancer_study_identifier = '{study_id}'
-            GROUP BY gene_panel_id
-            ORDER BY sample_count DESC
-            LIMIT 10
-        """)
+        panels = panels_future.result()
         if panels:
             guide_sections.append("## Gene Panels\n")
             for p in panels:
@@ -827,14 +903,7 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 5. Clinical attributes available
-        attrs = run_select_query(f"""
-            SELECT DISTINCT attribute_name, COUNT(DISTINCT sample_unique_id) as coverage
-            FROM clinical_data_derived
-            WHERE cancer_study_identifier = '{study_id}'
-            GROUP BY attribute_name
-            ORDER BY coverage DESC
-            LIMIT 20
-        """)
+        attrs = attrs_future.result()
         if attrs:
             guide_sections.append("## Available Clinical Attributes\n")
             guide_sections.append("| Attribute | Samples with Data |")
@@ -844,18 +913,7 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 6. Top mutated genes (if mutation data exists)
-        top_genes = run_select_query(f"""
-            SELECT 
-                hugo_gene_symbol,
-                COUNT(DISTINCT sample_unique_id) as altered_samples
-            FROM genomic_event_derived
-            WHERE cancer_study_identifier = '{study_id}'
-                AND variant_type = 'mutation'
-                AND mutation_status != 'UNCALLED'
-            GROUP BY hugo_gene_symbol
-            ORDER BY altered_samples DESC
-            LIMIT 10
-        """)
+        top_genes = top_genes_future.result()
         if top_genes:
             guide_sections.append("## Top Mutated Genes\n")
             guide_sections.append("| Gene | Altered Samples |")
@@ -865,14 +923,7 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 7. Sample type distribution
-        sample_types = run_select_query(f"""
-            SELECT attribute_value as sample_type, COUNT(DISTINCT sample_unique_id) as count
-            FROM clinical_data_derived
-            WHERE cancer_study_identifier = '{study_id}'
-                AND attribute_name = 'SAMPLE_TYPE'
-            GROUP BY attribute_value
-            ORDER BY count DESC
-        """)
+        sample_types = sample_types_future.result()
         if sample_types:
             guide_sections.append("## Sample Types\n")
             for st in sample_types:
@@ -963,7 +1014,7 @@ def _fetch_and_store_studies() -> tuple[tuple[tuple[str, object], ...], ...]:
                 GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
                 ORDER BY sample_count DESC
             """
-    rows = run_select_query(query)
+    rows = run_select_query(query, query_label="list_studies.all_studies")
     _studies_cache_rows = tuple(tuple(row.items()) for row in rows)
     _studies_cache_fetched_at = time.monotonic()
     return _studies_cache_rows

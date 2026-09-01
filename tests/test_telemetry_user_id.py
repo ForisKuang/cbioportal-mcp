@@ -9,6 +9,7 @@ from mcp.types import Implementation
 from cbioportal_mcp.telemetry import (
     TelemetryMiddleware,
     _DogStatsDClient,
+    _emit_db_query_metrics,
     _emit_tool_metrics,
     _extract_mcp_client_info,
     _extract_oauth_identity,
@@ -17,6 +18,7 @@ from cbioportal_mcp.telemetry import (
     _resolve_caller_identity,
     _sanitize_datadog_tag_value,
     dogstatsd_metrics_configured,
+    traced_db_query,
 )
 
 
@@ -279,6 +281,71 @@ def test_emit_tool_metrics_tags_call_latency_and_errors():
             },
         ),
     ]
+
+
+def test_emit_db_query_metrics_tags_call_latency_and_errors():
+    calls = []
+
+    class FakeDogStatsD:
+        def increment(self, metric, tags):
+            calls.append(("increment", metric, tags))
+
+        def distribution(self, metric, value, tags):
+            calls.append(("distribution", metric, value, tags))
+
+    with patch("cbioportal_mcp.telemetry._get_dogstatsd_client", return_value=FakeDogStatsD()):
+        _emit_db_query_metrics(query_label="study_guide.counts", duration_ms=8.1234, success=False)
+
+    assert calls == [
+        ("increment", "db_query.calls", {"query_label": "study_guide.counts", "success": "false"}),
+        (
+            "distribution",
+            "db_query.duration_ms",
+            8.123,
+            {"query_label": "study_guide.counts", "success": "false"},
+        ),
+        ("increment", "db_query.errors", {"query_label": "study_guide.counts", "success": "false"}),
+    ]
+
+
+def test_traced_db_query_emits_success_metrics_and_no_error_tag():
+    calls = []
+
+    class FakeDogStatsD:
+        def increment(self, metric, tags):
+            calls.append(("increment", metric, tags))
+
+        def distribution(self, metric, value, tags):
+            calls.append(("distribution", metric, value, tags))
+
+    with patch("cbioportal_mcp.telemetry._get_dogstatsd_client", return_value=FakeDogStatsD()):
+        with traced_db_query("study_guide.study_info"):
+            pass
+
+    tags = {"query_label": "study_guide.study_info", "success": "true"}
+    assert calls == [
+        ("increment", "db_query.calls", tags),
+        ("distribution", "db_query.duration_ms", calls[1][2], tags),
+    ]
+
+
+def test_traced_db_query_reraises_and_tags_the_failure():
+    calls = []
+
+    class FakeDogStatsD:
+        def increment(self, metric, tags):
+            calls.append(("increment", metric, tags))
+
+        def distribution(self, metric, value, tags):
+            calls.append(("distribution", metric, value, tags))
+
+    with patch("cbioportal_mcp.telemetry._get_dogstatsd_client", return_value=FakeDogStatsD()):
+        with pytest.raises(RuntimeError, match="clickhouse unavailable"):
+            with traced_db_query("study_guide.counts"):
+                raise RuntimeError("clickhouse unavailable")
+
+    error_tags = {"query_label": "study_guide.counts", "success": "false"}
+    assert ("increment", "db_query.errors", error_tags) in calls
 
 
 @pytest.mark.asyncio
