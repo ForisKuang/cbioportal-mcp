@@ -239,17 +239,17 @@ def main():
         logger.critical("❌ ClickHouse permission check failed: %s", e)
         sys.exit(2)
 
-    # Warm the list_studies cache in the background so most early callers get
-    # a warm cache without blocking server startup on the ClickHouse round
-    # trip. Best-effort and fire-and-forget: a failure here just means the
-    # cache warms lazily on first real use instead, same as before this ran.
-    def _warm_studies_cache():
-        try:
-            _all_studies_query()
-        except Exception as e:
-            logger.warning(f"Failed to pre-warm list_studies cache: {e}")
+    # Warm the list_studies cache immediately, without blocking server
+    # startup on the ClickHouse round trip, then keep it proactively
+    # refreshed on the same background thread for the life of the process
+    # (see STUDIES_CACHE_REFRESH_INTERVAL_SECONDS) -- so it's not just the
+    # first caller after startup that benefits, but every caller, since a
+    # live request should almost never be the one paying for the refetch.
+    def _warm_then_keep_studies_cache_fresh():
+        _refresh_studies_cache_once()
+        _refresh_studies_cache_forever()
 
-    threading.Thread(target=_warm_studies_cache, daemon=True).start()
+    threading.Thread(target=_warm_then_keep_studies_cache_fresh, daemon=True).start()
 
     # Set up OpenTelemetry → Datadog agent (no-op if env vars not set or agent unreachable)
     provider = configure_telemetry()
@@ -908,10 +908,19 @@ WHERE cancer_study_identifier = '{study_id}'
 MAX_LIST_LIMIT = 100
 
 
-# How long a cached study snapshot is served before the next call refetches it.
-# The underlying data only changes via the daily clone job, so this just bounds
-# how long a study add/remove can take to become visible without a restart.
+# How long a cached study snapshot is served before an on-demand call
+# refetches it. The underlying data only changes via the daily clone job, so
+# this is a fallback staleness bound, not the primary refresh mechanism: see
+# STUDIES_CACHE_REFRESH_INTERVAL_SECONDS below for that.
 STUDIES_CACHE_TTL_SECONDS = 900
+
+# How often the background loop started in main() proactively refetches,
+# well ahead of STUDIES_CACHE_TTL_SECONDS expiry, so a live list_studies()
+# call almost never lands on the request that pays for the ClickHouse round
+# trip -- only the periodic background refresh does. Kept with headroom
+# below the TTL so a slow or delayed refresh cycle doesn't still let the
+# cache go stale before the next one lands.
+STUDIES_CACHE_REFRESH_INTERVAL_SECONDS = 600
 
 _studies_cache_lock = threading.Lock()
 _studies_cache_rows: tuple[tuple[tuple[str, object], ...], ...] | None = None
@@ -926,25 +935,52 @@ def _clear_studies_cache() -> None:
         _studies_cache_fetched_at = 0.0
 
 
-def _all_studies_query() -> tuple[tuple[tuple[str, object], ...], ...]:
-    """Return every study's full detail, refetched at most every
-    STUDIES_CACHE_TTL_SECONDS.
-
-    Mirrors cbioportal's own /api/studies?projection=DETAILED, which caches
-    the entire study list rather than one entry per distinct query shape.
-    list_studies() filters this single snapshot in Python by search/limit/
-    verbose, so every call is a cache hit regardless of the search term used,
-    except for the one caller per TTL window that pays the refetch.
+def _fetch_and_store_studies() -> tuple[tuple[tuple[str, object], ...], ...]:
+    """Query ClickHouse for every study's full detail and store it as the
+    cache snapshot. Caller must hold _studies_cache_lock.
 
     Use sample/patient for counts instead of clinical_data_derived. The latter
     has many clinical-attribute rows per sample and makes first-connect study
     discovery slower than it needs to be.
+    """
+    global _studies_cache_rows, _studies_cache_fetched_at
+    query = """
+                SELECT
+                    cs.cancer_study_identifier,
+                    cs.name,
+                    cs.description,
+                    cs.type_of_cancer_id,
+                    COUNT(DISTINCT s.internal_id) as sample_count
+                FROM cancer_study cs
+                LEFT JOIN patient p ON p.cancer_study_id = cs.cancer_study_id
+                LEFT JOIN sample s ON s.patient_id = p.internal_id
+                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
+                ORDER BY sample_count DESC
+            """
+    rows = run_select_query(query)
+    _studies_cache_rows = tuple(tuple(row.items()) for row in rows)
+    _studies_cache_fetched_at = time.monotonic()
+    return _studies_cache_rows
+
+
+def _all_studies_query() -> tuple[tuple[tuple[str, object], ...], ...]:
+    """Return every study's full detail, refetched on-demand if the cache is
+    missing or older than STUDIES_CACHE_TTL_SECONDS.
+
+    Mirrors cbioportal's own /api/studies?projection=DETAILED, which caches
+    the entire study list rather than one entry per distinct query shape.
+    list_studies() filters this single snapshot in Python by search/limit/
+    verbose, so every call is a cache hit regardless of the search term used.
+
+    In steady state the background loop in main() keeps this fresh before
+    TTL ever expires (see STUDIES_CACHE_REFRESH_INTERVAL_SECONDS), so this
+    on-demand path is normally only exercised on the very first call after a
+    cold start, or if that background loop has stalled.
 
     Holds the lock across the refetch (not just the cache read) so concurrent
     callers past TTL expiry queue behind one refresh instead of each firing
     their own identical ClickHouse query.
     """
-    global _studies_cache_rows, _studies_cache_fetched_at
     with _studies_cache_lock:
         now = time.monotonic()
         if (
@@ -953,23 +989,30 @@ def _all_studies_query() -> tuple[tuple[tuple[str, object], ...], ...]:
         ):
             return _studies_cache_rows
 
-        query = """
-                    SELECT
-                        cs.cancer_study_identifier,
-                        cs.name,
-                        cs.description,
-                        cs.type_of_cancer_id,
-                        COUNT(DISTINCT s.internal_id) as sample_count
-                    FROM cancer_study cs
-                    LEFT JOIN patient p ON p.cancer_study_id = cs.cancer_study_id
-                    LEFT JOIN sample s ON s.patient_id = p.internal_id
-                    GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
-                    ORDER BY sample_count DESC
-                """
-        rows = run_select_query(query)
-        _studies_cache_rows = tuple(tuple(row.items()) for row in rows)
-        _studies_cache_fetched_at = now
-        return _studies_cache_rows
+        return _fetch_and_store_studies()
+
+
+def _refresh_studies_cache_once() -> None:
+    """Run a single proactive background refresh cycle. Best-effort: a
+    failed fetch is logged and left for the next cycle rather than raised,
+    so one bad refresh doesn't take down the background loop.
+    """
+    try:
+        with _studies_cache_lock:
+            _fetch_and_store_studies()
+    except Exception as e:
+        logger.warning(f"Background list_studies cache refresh failed: {e}")
+
+
+def _refresh_studies_cache_forever() -> None:
+    """Background loop: proactively refetch the study cache every
+    STUDIES_CACHE_REFRESH_INTERVAL_SECONDS for the life of the process. Runs
+    on a daemon thread started from main(); see that call site for how this
+    combines with the initial startup warm-up.
+    """
+    while True:
+        time.sleep(STUDIES_CACHE_REFRESH_INTERVAL_SECONDS)
+        _refresh_studies_cache_once()
 
 
 def _filter_studies(search: str | None, limit: int, verbose: bool) -> list[dict]:
