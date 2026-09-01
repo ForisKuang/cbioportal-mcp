@@ -19,6 +19,8 @@ import json
 import logging
 import re
 import sys
+import threading
+import time
 from functools import lru_cache
 from importlib import resources as importlib_resources
 from pathlib import Path
@@ -85,24 +87,6 @@ def _validate_table_name(table: str) -> str:
             "Table names may only contain alphanumeric characters and underscores."
         )
     return table
-
-def _sanitize_search_term(search: str) -> str:
-    """Sanitize a search term by escaping SQL special characters.
-    
-    Args:
-        search: The search term to sanitize
-        
-    Returns:
-        The sanitized search term safe for use in LIKE clauses
-    """
-    if not search:
-        return ""
-    # Escape single quotes by doubling them (SQL standard)
-    # Also escape % and _ which are LIKE wildcards
-    sanitized = search.replace("'", "''")
-    sanitized = sanitized.replace("%", "\\%")
-    sanitized = sanitized.replace("_", "\\_")
-    return sanitized
 
 # Resource loading using importlib.resources for proper package support
 def _get_resources_path() -> Path:
@@ -258,6 +242,18 @@ def main():
     except PermissionError as e:
         logger.critical("❌ ClickHouse permission check failed: %s", e)
         sys.exit(2)
+
+    # Warm the list_studies cache immediately, without blocking server
+    # startup on the ClickHouse round trip, then keep it proactively
+    # refreshed on the same background thread for the life of the process
+    # (see STUDIES_CACHE_REFRESH_INTERVAL_SECONDS) -- so it's not just the
+    # first caller after startup that benefits, but every caller, since a
+    # live request should almost never be the one paying for the refetch.
+    def _warm_then_keep_studies_cache_fresh():
+        _refresh_studies_cache_once()
+        _refresh_studies_cache_forever()
+
+    threading.Thread(target=_warm_then_keep_studies_cache_fresh, daemon=True).start()
 
     # Set up OpenTelemetry → Datadog agent (no-op if env vars not set or agent unreachable).
     # DogStatsD tool metrics can still use the same middleware when only the
@@ -917,8 +913,140 @@ WHERE cancer_study_identifier = '{study_id}'
 # Maximum allowed limit for list queries to prevent expensive unbounded queries
 MAX_LIST_LIMIT = 100
 
+
+# How long a cached study snapshot is served before an on-demand call
+# refetches it. The underlying data only changes via the daily clone job, so
+# this is a fallback staleness bound, not the primary refresh mechanism: see
+# STUDIES_CACHE_REFRESH_INTERVAL_SECONDS below for that.
+STUDIES_CACHE_TTL_SECONDS = 900
+
+# How often the background loop started in main() proactively refetches,
+# well ahead of STUDIES_CACHE_TTL_SECONDS expiry, so a live list_studies()
+# call almost never lands on the request that pays for the ClickHouse round
+# trip -- only the periodic background refresh does. Kept with headroom
+# below the TTL so a slow or delayed refresh cycle doesn't still let the
+# cache go stale before the next one lands.
+STUDIES_CACHE_REFRESH_INTERVAL_SECONDS = 600
+
+_studies_cache_lock = threading.Lock()
+_studies_cache_rows: tuple[tuple[tuple[str, object], ...], ...] | None = None
+_studies_cache_fetched_at: float = 0.0
+
+
+def _clear_studies_cache() -> None:
+    """Reset the cached study snapshot. Test hook; not used at runtime."""
+    global _studies_cache_rows, _studies_cache_fetched_at
+    with _studies_cache_lock:
+        _studies_cache_rows = None
+        _studies_cache_fetched_at = 0.0
+
+
+def _fetch_and_store_studies() -> tuple[tuple[tuple[str, object], ...], ...]:
+    """Query ClickHouse for every study's full detail and store it as the
+    cache snapshot. Caller must hold _studies_cache_lock.
+
+    Use sample/patient for counts instead of clinical_data_derived. The latter
+    has many clinical-attribute rows per sample and makes first-connect study
+    discovery slower than it needs to be.
+    """
+    global _studies_cache_rows, _studies_cache_fetched_at
+    query = """
+                SELECT
+                    cs.cancer_study_identifier,
+                    cs.name,
+                    cs.description,
+                    cs.type_of_cancer_id,
+                    COUNT(DISTINCT s.internal_id) as sample_count
+                FROM cancer_study cs
+                LEFT JOIN patient p ON p.cancer_study_id = cs.cancer_study_id
+                LEFT JOIN sample s ON s.patient_id = p.internal_id
+                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
+                ORDER BY sample_count DESC
+            """
+    rows = run_select_query(query)
+    _studies_cache_rows = tuple(tuple(row.items()) for row in rows)
+    _studies_cache_fetched_at = time.monotonic()
+    return _studies_cache_rows
+
+
+def _all_studies_query() -> tuple[tuple[tuple[str, object], ...], ...]:
+    """Return every study's full detail, refetched on-demand if the cache is
+    missing or older than STUDIES_CACHE_TTL_SECONDS.
+
+    Mirrors cbioportal's own /api/studies?projection=DETAILED, which caches
+    the entire study list rather than one entry per distinct query shape.
+    list_studies() filters this single snapshot in Python by search/limit/
+    verbose, so every call is a cache hit regardless of the search term used.
+
+    In steady state the background loop in main() keeps this fresh before
+    TTL ever expires (see STUDIES_CACHE_REFRESH_INTERVAL_SECONDS), so this
+    on-demand path is normally only exercised on the very first call after a
+    cold start, or if that background loop has stalled.
+
+    Holds the lock across the refetch (not just the cache read) so concurrent
+    callers past TTL expiry queue behind one refresh instead of each firing
+    their own identical ClickHouse query.
+    """
+    with _studies_cache_lock:
+        now = time.monotonic()
+        if (
+            _studies_cache_rows is not None
+            and (now - _studies_cache_fetched_at) < STUDIES_CACHE_TTL_SECONDS
+        ):
+            return _studies_cache_rows
+
+        return _fetch_and_store_studies()
+
+
+def _refresh_studies_cache_once() -> None:
+    """Run a single proactive background refresh cycle. Best-effort: a
+    failed fetch is logged and left for the next cycle rather than raised,
+    so one bad refresh doesn't take down the background loop.
+    """
+    try:
+        with _studies_cache_lock:
+            _fetch_and_store_studies()
+    except Exception as e:
+        logger.warning(f"Background list_studies cache refresh failed: {e}")
+
+
+def _refresh_studies_cache_forever() -> None:
+    """Background loop: proactively refetch the study cache every
+    STUDIES_CACHE_REFRESH_INTERVAL_SECONDS for the life of the process. Runs
+    on a daemon thread started from main(); see that call site for how this
+    combines with the initial startup warm-up.
+    """
+    while True:
+        time.sleep(STUDIES_CACHE_REFRESH_INTERVAL_SECONDS)
+        _refresh_studies_cache_once()
+
+
+def _filter_studies(search: str | None, limit: int, verbose: bool) -> list[dict]:
+    """Filter, limit, and shape the cached full study list for list_studies()."""
+    rows = [dict(row) for row in _all_studies_query()]
+
+    if search:
+        needle = search.lower()
+        rows = [
+            row
+            for row in rows
+            if needle in row["cancer_study_identifier"].lower()
+            or needle in row["name"].lower()
+            or needle in row["type_of_cancer_id"].lower()
+            or needle in (row["description"] or "").lower()
+        ]
+
+    rows = rows[:limit]
+
+    if not verbose:
+        for row in rows:
+            row.pop("description", None)
+
+    return rows
+
+
 @mcp.tool()
-def list_studies(search: str = None, limit: int = 20) -> list[dict]:
+def list_studies(search: str = None, limit: int = 20, verbose: bool = False) -> list[dict]:
     """List available cBioPortal studies.
 
     Studies with pre-generated guides (in resources/study-guides/) will have has_guide=True.
@@ -926,9 +1054,11 @@ def list_studies(search: str = None, limit: int = 20) -> list[dict]:
     Args:
         search: Optional search term to filter studies by name, identifier, cancer type, or description
         limit: Maximum number of studies to return (default 20, max 100)
+        verbose: Include longer study description text. Defaults to false for faster first-connect discovery.
 
     Returns:
-        List of studies with their identifiers, names, descriptions, sample counts, and guide availability
+        List of studies with identifiers, names, cancer types, sample counts, and guide availability.
+        Descriptions are included only when verbose=true.
     """
     available_guides = set(_list_available_study_guides())
     
@@ -936,43 +1066,8 @@ def list_studies(search: str = None, limit: int = 20) -> list[dict]:
     safe_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
     
     try:
-        if search:
-            # Sanitize search term to prevent SQL injection
-            safe_search = _sanitize_search_term(search)
-            query = f"""
-                SELECT
-                    cs.cancer_study_identifier,
-                    cs.name,
-                    cs.description,
-                    cs.type_of_cancer_id,
-                    COUNT(DISTINCT cd.sample_unique_id) as sample_count
-                FROM cancer_study cs
-                LEFT JOIN clinical_data_derived cd ON cs.cancer_study_identifier = cd.cancer_study_identifier
-                WHERE cs.cancer_study_identifier ILIKE '%{safe_search}%'
-                    OR cs.name ILIKE '%{safe_search}%'
-                    OR cs.type_of_cancer_id ILIKE '%{safe_search}%'
-                    OR cs.description ILIKE '%{safe_search}%'
-                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
-                ORDER BY sample_count DESC
-                LIMIT {safe_limit}
-            """
-        else:
-            query = f"""
-                SELECT
-                    cs.cancer_study_identifier,
-                    cs.name,
-                    cs.description,
-                    cs.type_of_cancer_id,
-                    COUNT(DISTINCT cd.sample_unique_id) as sample_count
-                FROM cancer_study cs
-                LEFT JOIN clinical_data_derived cd ON cs.cancer_study_identifier = cd.cancer_study_identifier
-                GROUP BY cs.cancer_study_identifier, cs.name, cs.description, cs.type_of_cancer_id
-                ORDER BY sample_count DESC
-                LIMIT {safe_limit}
-            """
-        
-        results = run_select_query(query)
-        
+        results = _filter_studies(search, safe_limit, bool(verbose))
+
         # Add has_guide field
         for study in results:
             study_id = study.get('cancer_study_identifier', '')
