@@ -384,8 +384,15 @@ def study_resolution_guide() -> str:
     return _study_resolution_guide_text()
 
 
+# Default and maximum rows clickhouse_run_select_query will return. A missing
+# or overly broad LIMIT in agent-written SQL should not be able to flood the
+# agent's context with an unbounded result set (mirrors MAX_LIST_LIMIT below).
+DEFAULT_SELECT_MAX_ROWS = 1000
+MAX_SELECT_MAX_ROWS = 10000
+
+
 @mcp.tool(
-    description="""
+    description=f"""
     Execute a ClickHouse SQL SELECT query.
 
     For complex analysis patterns, consult these query guides:
@@ -397,15 +404,36 @@ def study_resolution_guide() -> str:
     - cbioportal://study-resolution-guide - Missing studies, external portals, and substitute cohorts
     - cbioportal://common-pitfalls - Common query mistakes and how to avoid them
 
+    Args:
+        max_rows: Maximum rows to return (default {DEFAULT_SELECT_MAX_ROWS}, max {MAX_SELECT_MAX_ROWS}).
+            Prefer narrowing the query itself (add a LIMIT, aggregate, or filter) over raising this.
+
     Returns:
-        - On success: an object with a single field "rows" containing an array of result rows.
+        - On success: an object with field "rows" containing an array of result rows. If the
+          query produced more rows than max_rows, "rows" is truncated and "truncated": true,
+          "returned_rows", and "total_rows" are included.
         - On failure: an object with a single field "error_message" containing a string describing the error.
 """
 )
-def clickhouse_run_select_query(query: str) -> dict[str, list[dict] | str]:
+def clickhouse_run_select_query(
+    query: str, max_rows: int = DEFAULT_SELECT_MAX_ROWS
+) -> dict[str, list[dict] | str | bool | int]:
     try:
         result = run_select_query(query, query_label="clickhouse_run_select_query")
         logger.debug(f"clickhouse_run_select_query returns {result}")
+        safe_max_rows = max(1, min(int(max_rows), MAX_SELECT_MAX_ROWS))
+        if len(result) > safe_max_rows:
+            return {
+                "rows": result[:safe_max_rows],
+                "truncated": True,
+                "returned_rows": safe_max_rows,
+                "total_rows": len(result),
+                "note": (
+                    f"Result truncated to {safe_max_rows} of {len(result)} rows. "
+                    f"Narrow the query (add a LIMIT, aggregate, or filter) or pass a larger "
+                    f"max_rows (up to {MAX_SELECT_MAX_ROWS}) to see more."
+                ),
+            }
         return {"rows": result}
     except Exception as e:
         error_message = str(e)
