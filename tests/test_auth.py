@@ -53,5 +53,6 @@ def test_builds_google_provider_when_all_three_set():
         client_id=_ALL_GOOGLE_ENV["CBIOPORTAL_MCP_GOOGLE_CLIENT_ID"],
         client_secret=_ALL_GOOGLE_ENV["CBIOPORTAL_MCP_GOOGLE_CLIENT_SECRET"],
         base_url=_ALL_GOOGLE_ENV["CBIOPORTAL_MCP_GOOGLE_BASE_URL"],
+        required_scopes=["openid", "email", "profile"],
         require_authorization_consent=False,
     )
