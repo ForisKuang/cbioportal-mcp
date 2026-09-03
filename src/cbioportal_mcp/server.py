@@ -411,7 +411,7 @@ MAX_SELECT_MAX_ROWS = 10000
     Returns:
         - On success: an object with field "rows" containing an array of result rows. If the
           query produced more rows than max_rows, "rows" is truncated and "truncated": true,
-          "returned_rows", and "total_rows" are included.
+          "returned_rows", and a "note" are included.
         - On failure: an object with a single field "error_message" containing a string describing the error.
 """
 )
@@ -419,19 +419,29 @@ def clickhouse_run_select_query(
     query: str, max_rows: int = DEFAULT_SELECT_MAX_ROWS
 ) -> dict[str, list[dict] | str | bool | int]:
     try:
-        result = run_select_query(query, query_label="clickhouse_run_select_query")
-        logger.debug(f"clickhouse_run_select_query returns {result}")
         safe_max_rows = max(1, min(int(max_rows), MAX_SELECT_MAX_ROWS))
+        # Passing max_rows threads it through to ClickHouse as
+        # max_result_rows/result_overflow_mode, so the engine can stop scanning
+        # early for query shapes that allow it. It rounds up to the next block
+        # boundary rather than cutting exactly at safe_max_rows, so the slice
+        # below is still needed to enforce the exact count.
+        result = run_select_query(
+            query, query_label="clickhouse_run_select_query", max_rows=safe_max_rows
+        )
+        logger.debug(f"clickhouse_run_select_query returns {result}")
         if len(result) > safe_max_rows:
             return {
                 "rows": result[:safe_max_rows],
                 "truncated": True,
                 "returned_rows": safe_max_rows,
-                "total_rows": len(result),
+                # No total_rows here: once ClickHouse stops scanning early, the
+                # true total is unknown without a separate full COUNT(*), which
+                # would defeat the point of stopping early.
                 "note": (
-                    f"Result truncated to {safe_max_rows} of {len(result)} rows. "
-                    f"Narrow the query (add a LIMIT, aggregate, or filter) or pass a larger "
-                    f"max_rows (up to {MAX_SELECT_MAX_ROWS}) to see more."
+                    f"Result truncated to {safe_max_rows} rows; more rows matched but the "
+                    f"exact total is unknown because the query was capped during execution "
+                    f"for efficiency. Narrow the query (add a LIMIT, aggregate, or filter) or "
+                    f"pass a larger max_rows (up to {MAX_SELECT_MAX_ROWS}) to see more."
                 ),
             }
         return {"rows": result}
@@ -510,7 +520,7 @@ def clickhouse_list_table_columns(table: str) -> dict[str, list[dict] | str]:
         return {"error_message": error_message}
 
 
-def run_select_query(query: str, *, query_label: str) -> list[dict]:
+def run_select_query(query: str, *, query_label: str, max_rows: int | None = None) -> list[dict]:
     """
     Execute arbitrary ClickHouse SQL SELECT query.
 
@@ -524,19 +534,71 @@ def run_select_query(query: str, *, query_label: str) -> list[dict]:
             per-call-site label its own latency metric would average a cheap
             lookup together with an expensive multi-table aggregate. Use
             "area.purpose", not the raw SQL text.
+        max_rows: When given, cap ClickHouse's own row materialization (via
+            max_result_rows/result_overflow_mode query settings) instead of
+            fetching every row and only trimming in Python. Lets the engine
+            stop scanning early for query shapes that allow it (no blocking
+            GROUP BY/ORDER BY/DISTINCT). Bypasses the vendored ClickHouse MCP's
+            run_select_query, which has a fixed signature with no settings
+            passthrough.
 
     Returns:
         list: A list of rows, where each row is a dictionary with column names as keys and corresponding values.
     """
-    from mcp_clickhouse.mcp_server import run_select_query
-
     # DB-level read-only permissions (enforced on startup) prevent non-SELECT queries,
     # so we don't need application-level query filtering. This allows CTEs (WITH ... AS).
-    logger.debug("run_select_query: delegate the query to run_select_query tool of ClickHouse MCP")
     with traced_db_query(query_label):
-        ch_query_result = run_select_query(query)
+        if max_rows is not None:
+            logger.debug("run_select_query: executing with a ClickHouse-side max_result_rows cap")
+            ch_query_result = _execute_row_capped_select_query(query, max_rows)
+        else:
+            from mcp_clickhouse.mcp_server import run_select_query as _ch_run_select_query
+
+            logger.debug("run_select_query: delegate the query to run_select_query tool of ClickHouse MCP")
+            ch_query_result = _ch_run_select_query(query)
         result = zip_select_query_result(ch_query_result)
     return result
+
+
+def _execute_row_capped_select_query(query: str, max_rows: int) -> dict:
+    """Run a SELECT query directly against ClickHouse with a server-side row cap.
+
+    Mirrors mcp_clickhouse.mcp_server.run_select_query/execute_query (same
+    thread pool, timeout, and readonly-setting resolution), but additionally
+    passes max_result_rows/result_overflow_mode=break so ClickHouse can stop
+    scanning early instead of always computing the full result set.
+    """
+    import concurrent.futures
+
+    from fastmcp.exceptions import ToolError
+    from mcp_clickhouse.mcp_server import (
+        QUERY_EXECUTOR,
+        SELECT_QUERY_TIMEOUT_SECS,
+        create_clickhouse_client,
+        get_readonly_setting,
+    )
+
+    def _execute() -> dict:
+        client = create_clickhouse_client()
+        read_only = get_readonly_setting(client)
+        res = client.query(
+            query,
+            settings={
+                "readonly": read_only,
+                "max_result_rows": max_rows,
+                "result_overflow_mode": "break",
+            },
+        )
+        logger.info(f"Query returned {len(res.result_rows)} rows (max_result_rows={max_rows})")
+        return {"columns": res.column_names, "rows": res.result_rows}
+
+    future = QUERY_EXECUTOR.submit(_execute)
+    try:
+        return future.result(timeout=SELECT_QUERY_TIMEOUT_SECS)
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"Query timed out after {SELECT_QUERY_TIMEOUT_SECS} seconds: {query}")
+        future.cancel()
+        raise ToolError(f"Query timed out after {SELECT_QUERY_TIMEOUT_SECS} seconds")
 
 
 def zip_select_query_result(ch_query_result) -> list[dict]:
