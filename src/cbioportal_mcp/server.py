@@ -387,7 +387,7 @@ def study_resolution_guide() -> str:
 # Default and maximum rows clickhouse_run_select_query will return. A missing
 # or overly broad LIMIT in agent-written SQL should not be able to flood the
 # agent's context with an unbounded result set (mirrors MAX_LIST_LIMIT below).
-DEFAULT_SELECT_MAX_ROWS = 1000
+DEFAULT_SELECT_MAX_ROWS = 100
 MAX_SELECT_MAX_ROWS = 10000
 
 
