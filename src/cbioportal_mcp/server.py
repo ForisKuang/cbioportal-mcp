@@ -14,8 +14,13 @@ from fastmcp import FastMCP
 
 from cbioportal_mcp.env import get_mcp_config, TransportType
 from cbioportal_mcp.authentication.permissions import ensure_db_permissions
+from cbioportal_mcp.clickhouse_pool import install_pooled_clickhouse_client
 
 logger = logging.getLogger(__name__)
+
+# Must happen before any tool call reaches mcp_clickhouse -- ensure_db_permissions()
+# below is already the first thing that triggers client creation at startup.
+install_pooled_clickhouse_client()
 
 # Regex pattern for valid cBioPortal study identifiers
 # Allows alphanumeric characters, underscores, and hyphens
