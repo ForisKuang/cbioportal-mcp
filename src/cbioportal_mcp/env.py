@@ -60,6 +60,44 @@ class McpConfig:
         return int(os.getenv("CLICKHOUSE_MCP_BIND_PORT", "8000"))
 
     @property
+    def mcp_http_path(self) -> Optional[str]:
+        """Get the HTTP path under which to mount the MCP server.
+
+        Set when the server is reverse-proxied behind a sub-path so that
+        FastMCP's generated URLs (e.g. trailing-slash redirects) include
+        the external prefix. Example: "/db/mcp" when served at
+        https://host/db/mcp via Traefik without stripPrefix.
+
+        Only used when transport is "http" or "sse". When unset, FastMCP
+        uses its default path ("/mcp").
+        """
+        value = os.getenv("CLICKHOUSE_MCP_HTTP_PATH")
+        return value if value else None
+
+    @property
+    def mcp_forwarded_allow_ips(self) -> Optional[str]:
+        """Get the set of upstream IPs whose X-Forwarded-* headers uvicorn
+        should trust. Forwarded as `forwarded_allow_ips` to `uvicorn.Config`.
+
+        Set this when the server sits behind a reverse proxy that
+        terminates TLS (e.g. Traefik with an https Ingress) — otherwise
+        uvicorn ignores `X-Forwarded-Proto: https` and builds redirect
+        Locations from its own scheme (http), which strict clients refuse
+        to follow.
+
+        Common values:
+          - "*"                  trust any upstream (fine inside a Pod
+                                 reachable only via in-cluster Services)
+          - "10.0.0.0/8,..."     scope to a CIDR (e.g. the Traefik LB
+                                 source range)
+
+        Only used when transport is "http" or "sse". When unset, uvicorn
+        defaults apply (trust only 127.0.0.1, no proxy_headers).
+        """
+        value = os.getenv("CLICKHOUSE_MCP_FORWARDED_ALLOW_IPS")
+        return value if value else None
+
+    @property
     def mcp_user(self) -> str:
         """Get the clickhouse user for which the MCP server is running for.
 
@@ -76,6 +114,35 @@ class McpConfig:
         """
 
         return str(os.getenv("CLICKHOUSE_DATABASE", "cgds_public_2025_06_24"))
+
+    @property
+    def google_client_id(self) -> Optional[str]:
+        """Google OAuth client ID (from Google Cloud Console).
+
+        Example: "123-abc.apps.googleusercontent.com".
+
+        One of the three Google OAuth settings gating whether OAuth is enabled
+        at all — see `cbioportal_mcp.auth._build_auth_provider`. Any Google
+        account can authenticate; there is no Workspace-domain restriction.
+        """
+        value = os.getenv("CBIOPORTAL_MCP_GOOGLE_CLIENT_ID")
+        return value if value else None
+
+    @property
+    def google_client_secret(self) -> Optional[str]:
+        """Google OAuth client secret (from Google Cloud Console)."""
+        value = os.getenv("CBIOPORTAL_MCP_GOOGLE_CLIENT_SECRET")
+        return value if value else None
+
+    @property
+    def google_base_url(self) -> Optional[str]:
+        """This server's own public URL, used to construct its OAuth redirect/callback URIs.
+
+        Example: "https://mcp.cbioportal.org". Must match a redirect URI
+        registered on the Google OAuth client (base_url + "/auth/callback").
+        """
+        value = os.getenv("CBIOPORTAL_MCP_GOOGLE_BASE_URL")
+        return value if value else None
 
 
 # Global instance placeholders for the singleton pattern
