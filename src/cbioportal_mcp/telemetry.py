@@ -80,29 +80,96 @@ def shutdown_telemetry() -> None:
 
 
 def _extract_user_identity() -> tuple[str | None, str | None]:
-    """Read x-user-id and x-user-email headers injected by LibreChat.
+    """Read the current request's identity (user_id, user_email), either may be None.
 
-    LibreChat populates these via {{LIBRECHAT_USER_ID}} / {{LIBRECHAT_USER_EMAIL}}
-    placeholders in mcpServers.headers. Returns (user_id, user_email), either may
-    be None. LibreChat base64-encodes non-ASCII values with a "b64:" prefix.
+    Delegates to the same header resolution used for study authorization
+    (``cbioportal_mcp.authentication.study_access.extract_request_identity``),
+    which checks LibreChat's x-user-id/x-user-email convention first, then
+    falls back to trusted-proxy headers (x-auth-request-user/email,
+    x-forwarded-user/email, x-keycloak-sub/user/email). This keeps identity
+    resolution consistent everywhere: a Keycloak/oauth2-proxy-fronted deployment
+    now shows up with a real usr.id in traces even when the caller isn't
+    LibreChat, instead of only counting LibreChat's own header convention.
     """
     try:
-        from fastmcp.server.dependencies import get_http_headers
+        from cbioportal_mcp.authentication.study_access import extract_request_identity
 
-        headers = get_http_headers(include_all=True)
-        raw_id = headers.get("x-user-id", "")
-        raw_email = headers.get("x-user-email", "")
-        logger.debug("_extract_user_identity: x-user-id=%r x-user-email=%r", raw_id, raw_email)
-
-        user_id = raw_id or None
-        user_email = raw_email or None
-        if user_email and user_email.startswith("b64:"):
-            import base64
-            user_email = base64.b64decode(user_email[4:]).decode("utf-8", errors="replace")
-        return user_id, user_email
+        identity = extract_request_identity()
+        return identity.user_id, identity.user_email
     except Exception as exc:
         logger.debug("_extract_user_identity failed: %s", exc)
         return None, None
+
+
+def _extract_mcp_client_info(
+    context: MiddlewareContext[mt.CallToolRequestParams],
+) -> tuple[str | None, str | None]:
+    """Read the MCP client's self-reported identity from the initialize handshake.
+
+    Every MCP client (LibreChat, Claude Code, Codex, Claude Desktop, ...) sends
+    a ``clientInfo`` block (``name``/``version``) as part of ``initialize``. This
+    is the one signal that reliably distinguishes *which application* is on the
+    other end of the connection, independent of the LibreChat-specific
+    x-user-id/x-user-email header convention (which only LibreChat sends, so a
+    direct connector otherwise looks identical to an anonymous LibreChat call).
+
+    Returns (client_name, client_version), either may be None.
+    """
+    try:
+        fastmcp_context = context.fastmcp_context
+        if fastmcp_context is None:
+            return None, None
+        client_params = fastmcp_context.session.client_params
+        if client_params is None:
+            return None, None
+        client_info = client_params.clientInfo
+        return client_info.name or None, client_info.version or None
+    except Exception as exc:
+        logger.debug("_extract_mcp_client_info failed: %s", exc)
+        return None, None
+
+
+def _extract_session_id(
+    context: MiddlewareContext[mt.CallToolRequestParams],
+) -> str | None:
+    """Read the MCP transport session ID (Streamable HTTP / SSE) for this call.
+
+    Stable for the lifetime of one client connection, then a fresh session ID
+    is issued on reconnect. Unlike network.client.ip (shared behind NAT/VPN,
+    unstable on dynamic IPs) or usr.id (only present when a trusted proxy or
+    LibreChat injects identity headers), this gives a reliable count of
+    distinct *connections* even for anonymous direct-connector traffic —
+    e.g. "how many separate Claude Code sessions hit the server today",
+    independent of whether any user identity was ever attached. It is not a
+    persistent user identity: the same human reconnecting gets a new ID.
+
+    Returns None for stdio/in-memory transports, which have no session ID.
+    """
+    try:
+        fastmcp_context = context.fastmcp_context
+        if fastmcp_context is None:
+            return None
+        return fastmcp_context.session_id
+    except Exception as exc:
+        logger.debug("_extract_session_id failed: %s", exc)
+        return None
+
+
+def _extract_request_source() -> str:
+    """Classify the request as coming through a trusted, header-injecting proxy
+    or arriving direct (e.g. a connector plugged straight into the MCP endpoint).
+
+    Reuses the broader identity-header detection already used for study
+    authorization, so this stays consistent with what authz considers
+    "authenticated" rather than re-deriving its own header list.
+    """
+    try:
+        from cbioportal_mcp.authentication.study_access import extract_request_identity
+
+        return extract_request_identity().client
+    except Exception as exc:
+        logger.debug("_extract_request_source failed: %s", exc)
+        return "unknown"
 
 
 def _extract_client_ip() -> str | None:
@@ -133,7 +200,16 @@ def _extract_client_ip() -> str | None:
     return None
 
 
-def _llmobs_tool_span(tool_name: str, arguments: dict, user_id: str | None, user_email: str | None):
+def _llmobs_tool_span(
+    tool_name: str,
+    arguments: dict,
+    user_id: str | None,
+    user_email: str | None,
+    client_name: str | None,
+    client_version: str | None,
+    request_source: str,
+    session_id: str | None,
+):
     """Start a Datadog LLMObs tool span for an MCP tool call.
 
     Returns None if LLMObs is not initialized (e.g. no DD_API_KEY).
@@ -144,10 +220,22 @@ def _llmobs_tool_span(tool_name: str, arguments: dict, user_id: str | None, user
         span = LLMObs.start_span(span_kind="tool", name=f"mcp.tool.{tool_name}")
         if user_id:
             span.set_tag("usr.id", user_id)
+        if client_name:
+            span.set_tag("mcp.client.name", client_name)
+        span.set_tag("mcp.request.source", request_source)
+        if session_id:
+            span.set_tag("mcp.session.id", session_id)
 
         metadata: dict = {}
         if user_email:
             metadata["user_email"] = user_email
+        if client_name:
+            metadata["mcp_client_name"] = client_name
+        if client_version:
+            metadata["mcp_client_version"] = client_version
+        if session_id:
+            metadata["mcp_session_id"] = session_id
+        metadata["request_source"] = request_source
 
         LLMObs.annotate(
             span=span,
@@ -197,10 +285,21 @@ class TelemetryMiddleware(Middleware):
 
     OTel span name : ``mcp.tool/<tool_name>``
     OTel attributes:
-      mcp.tool.name       Tool name
-      network.client.ip   Original client IP from X-Forwarded-For (HTTP only)
-      mcp.tool.success    True on success, False when an exception propagates
-      error.type          Exception class name on failure
+      mcp.tool.name        Tool name
+      network.client.ip    Original client IP from X-Forwarded-For (HTTP only)
+      mcp.tool.success     True on success, False when an exception propagates
+      error.type           Exception class name on failure
+      mcp.client.name      Client app name from the MCP initialize handshake
+                           (e.g. "librechat", "claude-code", "codex") — the
+                           reliable signal for which surface is calling in,
+                           independent of the LibreChat-only x-user-id header.
+      mcp.client.version   Client app version from the same handshake.
+      mcp.request.source   "authenticated-proxy" when trusted identity headers
+                           were present, "direct" otherwise (mirrors the
+                           classification used for study authorization).
+      mcp.session.id       MCP transport session ID (HTTP/SSE only) — a stable
+                           per-connection ID usable to count distinct sessions
+                           even when no user identity is attached.
 
     The LLMObs tool span populates the Datadog LLM Observability dashboard widgets
     (Trace Success Rate, Total Number of Traces, Estimated Total Cost).
@@ -217,14 +316,34 @@ class TelemetryMiddleware(Middleware):
         tool_name = getattr(context.message, "name", None) or "unknown"
         arguments = getattr(context.message, "arguments", {}) or {}
         user_id, user_email = _extract_user_identity()
+        client_name, client_version = _extract_mcp_client_info(context)
+        request_source = _extract_request_source()
+        session_id = _extract_session_id(context)
 
-        llmobs_span = _llmobs_tool_span(tool_name, arguments, user_id, user_email)
+        llmobs_span = _llmobs_tool_span(
+            tool_name,
+            arguments,
+            user_id,
+            user_email,
+            client_name,
+            client_version,
+            request_source,
+            session_id,
+        )
 
         with self._tracer.start_as_current_span(f"mcp.tool/{tool_name}") as span:
             span.set_attribute("mcp.tool.name", tool_name)
             span.set_attribute("mcp.user_id.present", user_id is not None)
             if user_id:
                 span.set_attribute("enduser.id", user_id)
+
+            span.set_attribute("mcp.request.source", request_source)
+            if client_name:
+                span.set_attribute("mcp.client.name", client_name)
+            if client_version:
+                span.set_attribute("mcp.client.version", client_version)
+            if session_id:
+                span.set_attribute("mcp.session.id", session_id)
 
             client_ip = _extract_client_ip()
             if client_ip:
