@@ -34,6 +34,8 @@ import mcp.types as mt
 from cbioportal_mcp.env import get_mcp_config, TransportType
 from cbioportal_mcp.authentication.permissions import ensure_db_permissions
 from cbioportal_mcp.auth import _build_auth_provider
+from cbioportal_mcp.db_client import execute_query
+from cbioportal_mcp.metadata_cache import MetadataCache
 from cbioportal_mcp.telemetry import (
     TelemetryMiddleware,
     configure_telemetry,
@@ -42,6 +44,19 @@ from cbioportal_mcp.telemetry import (
 )
 
 logger = logging.getLogger(__name__)
+_schema_cache = MetadataCache()
+_study_guide_cache = MetadataCache()
+
+
+def _clear_schema_cache() -> None:
+    """Clear cached table lists and column descriptions."""
+    _schema_cache.clear()
+
+
+def _clear_study_guide_cache() -> None:
+    """Clear generated study guides after data refresh or in tests."""
+    _study_guide_cache.clear()
+
 
 # Regex pattern for valid cBioPortal study identifiers
 # Allows alphanumeric characters, underscores, and hyphens
@@ -405,7 +420,7 @@ def study_resolution_guide() -> str:
 def clickhouse_run_select_query(query: str) -> dict[str, list[dict] | str]:
     try:
         result = run_select_query(query, query_label="clickhouse_run_select_query")
-        logger.debug(f"clickhouse_run_select_query returns {result}")
+        logger.debug("clickhouse_run_select_query returns %s", result)
         return {"rows": result}
     except Exception as e:
         error_message = str(e)
@@ -427,12 +442,16 @@ def clickhouse_list_tables() -> dict[str, list[dict] | str]:
     logger.info(f"clickhouse_list_tables: called")
 
     try:
-        from mcp_clickhouse.mcp_server import execute_query
+        cached = _schema_cache.get(("tables",))
+        if cached is not None:
+            return cached
         raw = execute_query("SHOW TABLES")
         rows = raw.get("rows", [])
         result = [{"name": row[0]} for row in rows if row]
-        logger.debug(f"clickhouse_list_tables result: {result}")
-        return {"tables": result}
+        logger.debug("clickhouse_list_tables result: %s", result)
+        response = {"tables": result}
+        _schema_cache.put(("tables",), response)
+        return response
     except Exception as e:
         error_message = str(e)
         logger.error(f"clickhouse_list_tables: {error_message}")
@@ -456,7 +475,9 @@ def clickhouse_list_table_columns(table: str) -> dict[str, list[dict] | str]:
 
     try:
         table = _validate_table_name(table)
-        from mcp_clickhouse.mcp_server import execute_query
+        cached = _schema_cache.get(("columns", table))
+        if cached is not None:
+            return cached
         raw = execute_query(f"DESCRIBE TABLE {table}")
         columns_list = raw.get("columns", [])
         rows = raw.get("rows", [])
@@ -474,8 +495,10 @@ def clickhouse_list_table_columns(table: str) -> dict[str, list[dict] | str]:
             if len(row) > comment_idx and row[comment_idx]:
                 entry["comment"] = row[comment_idx]
             result.append(entry)
-        logger.debug(f"clickhouse_list_table_columns result: {result}")
-        return {"columns": result}
+        logger.debug("clickhouse_list_table_columns result: %s", result)
+        response = {"columns": result}
+        _schema_cache.put(("columns", table), response)
+        return response
     except Exception as e:
         error_message = str(e)
         logger.error(f"clickhouse_list_table_columns: {error_message}")
@@ -500,13 +523,12 @@ def run_select_query(query: str, *, query_label: str) -> list[dict]:
     Returns:
         list: A list of rows, where each row is a dictionary with column names as keys and corresponding values.
     """
-    from mcp_clickhouse.mcp_server import run_select_query
 
     # DB-level read-only permissions (enforced on startup) prevent non-SELECT queries,
     # so we don't need application-level query filtering. This allows CTEs (WITH ... AS).
-    logger.debug("run_select_query: delegate the query to run_select_query tool of ClickHouse MCP")
+    logger.debug("run_select_query: execute on a reusable ClickHouse worker")
     with traced_db_query(query_label):
-        ch_query_result = run_select_query(query)
+        ch_query_result = execute_query(query)
         result = zip_select_query_result(ch_query_result)
     return result
 
@@ -754,6 +776,11 @@ def get_study_guide(study_id: str) -> str:
         logger.info(f"Loaded static study guide for {study_id}")
         return static_guide
 
+    cache_key = study_id.lower()
+    cached = _study_guide_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     # Fall back to dynamic generation
     logger.info(f"Generating dynamic study guide for {study_id}")
     try:
@@ -786,14 +813,8 @@ def get_study_guide(study_id: str) -> str:
 **Description:** {info.get('description', 'N/A')}
 """)
 
-        # Sections 2-7 below only depend on study_id, not on each other or on
-        # section order, so they're fired concurrently here instead of one
-        # ClickHouse round trip at a time -- each pays the same fixed
-        # per-call connection overhead (see run_select_query), so six
-        # sequential calls cost roughly six times that overhead in wall
-        # clock, while six concurrent ones cost roughly one. Results are
-        # still consumed in the original section order below, so the guide's
-        # output is unchanged regardless of which query finishes first.
+        # Sections 2-7 are independent. Fetch concurrently, then assemble in
+        # section order. DB work uses persistent workers with reusable clients.
         with ThreadPoolExecutor(max_workers=6) as executor:
             counts_future = executor.submit(
                 run_select_query,
@@ -954,7 +975,9 @@ WHERE cancer_study_identifier = '{study_id}'
 ```
 """)
         
-        return "\n".join(guide_sections)
+        guide = "\n".join(guide_sections)
+        _study_guide_cache.put(cache_key, guide)
+        return guide
         
     except Exception as e:
         logger.error(f"get_study_guide error: {e}")
