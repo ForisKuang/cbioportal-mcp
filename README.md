@@ -47,6 +47,35 @@ export CLICKHOUSE_MCP_SERVER_TRANSPORT=stdio # or http or sse
 # export CLICKHOUSE_MCP_HTTP_PATH=/db/mcp
 ```
 
+### Authentication (HTTP/SSE)
+
+The `http` and `sse` transports **fail closed**: they require Google OAuth and
+refuse to start without it. `stdio` needs no auth (it's a local process the
+caller already trusts).
+
+```bash
+# Google OAuth — set all three, or none. Setting only some is a startup error.
+export CBIOPORTAL_MCP_GOOGLE_CLIENT_ID=123-abc.apps.googleusercontent.com
+export CBIOPORTAL_MCP_GOOGLE_CLIENT_SECRET=...
+export CBIOPORTAL_MCP_GOOGLE_BASE_URL=https://mcp.cbioportal.org  # redirect URI: <base>/auth/callback
+
+# Optional allowlist (comma-separated, case-insensitive). When either is set,
+# only users whose Google-verified email exactly matches an entry in
+# ALLOWED_EMAILS, or whose domain exactly equals an entry in
+# ALLOWED_EMAIL_DOMAINS, get through; everyone else gets a 401. Domains are
+# exact matches (mskcc.org does not match evilmskcc.org or sub.mskcc.org).
+# Unset (default): any Google account can authenticate.
+# export CBIOPORTAL_MCP_ALLOWED_EMAIL_DOMAINS=mskcc.org,example.org
+# export CBIOPORTAL_MCP_ALLOWED_EMAILS=alice@gmail.com
+
+# Opt-outs (only "true"/"1"/"yes"/"on" enable them; each logs a warning):
+# Run http/sse with NO authentication — only behind a trusted network boundary.
+# export CBIOPORTAL_MCP_ALLOW_UNAUTHENTICATED=true
+# Skip FastMCP's OAuth consent screen, which protects against a malicious MCP
+# client being authorized without the user seeing which app is asking.
+# export CBIOPORTAL_MCP_SKIP_AUTH_CONSENT=true
+```
+
 ### Datadog Tool Metrics
 
 The server emits one OpenTelemetry span per MCP tool call and can also emit

@@ -33,7 +33,7 @@ import mcp.types as mt
 
 from cbioportal_mcp.env import get_mcp_config, TransportType
 from cbioportal_mcp.authentication.permissions import ensure_db_permissions
-from cbioportal_mcp.auth import _build_auth_provider
+from cbioportal_mcp.auth import _build_auth_provider, ensure_auth_configured
 from cbioportal_mcp.telemetry import (
     TelemetryMiddleware,
     configure_telemetry,
@@ -238,6 +238,12 @@ def main():
 
     # Get config
     config = get_mcp_config()
+
+    try:
+        ensure_auth_configured(config.mcp_server_transport, mcp.auth)
+    except RuntimeError as e:
+        logger.critical("❌ %s", e)
+        sys.exit(2)
 
     try:
         ensure_db_permissions(config=config)
