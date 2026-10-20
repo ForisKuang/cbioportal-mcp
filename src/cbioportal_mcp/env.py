@@ -123,7 +123,8 @@ class McpConfig:
 
         One of the three Google OAuth settings gating whether OAuth is enabled
         at all — see `cbioportal_mcp.auth._build_auth_provider`. Any Google
-        account can authenticate; there is no Workspace-domain restriction.
+        account can authenticate unless CBIOPORTAL_MCP_ALLOWED_EMAIL_DOMAINS /
+        CBIOPORTAL_MCP_ALLOWED_EMAILS restrict it.
         """
         value = os.getenv("CBIOPORTAL_MCP_GOOGLE_CLIENT_ID")
         return value if value else None
@@ -143,6 +144,48 @@ class McpConfig:
         """
         value = os.getenv("CBIOPORTAL_MCP_GOOGLE_BASE_URL")
         return value if value else None
+
+    @property
+    def allow_unauthenticated(self) -> bool:
+        """Explicit opt-out allowing HTTP/SSE transports to run with no auth provider.
+
+        Default: False — an HTTP/SSE server without Google OAuth refuses to
+        start. stdio is unaffected (local process trust).
+        """
+        return _env_opt_in("CBIOPORTAL_MCP_ALLOW_UNAUTHENTICATED")
+
+    @property
+    def skip_auth_consent(self) -> bool:
+        """Skip FastMCP's OAuth consent screen. Default: False (consent shown)."""
+        return _env_opt_in("CBIOPORTAL_MCP_SKIP_AUTH_CONSENT")
+
+    @property
+    def allowed_email_domains(self) -> frozenset[str]:
+        """Lowercased email domains allowed to authenticate, e.g. "mskcc.org,example.org".
+
+        Empty (default) means no domain restriction.
+        """
+        return _env_csv_lower("CBIOPORTAL_MCP_ALLOWED_EMAIL_DOMAINS")
+
+    @property
+    def allowed_emails(self) -> frozenset[str]:
+        """Lowercased individual emails allowed to authenticate. Empty means no restriction."""
+        return _env_csv_lower("CBIOPORTAL_MCP_ALLOWED_EMAILS")
+
+
+def _env_opt_in(name: str) -> bool:
+    """Strict opt-in flag: only "1"/"true"/"yes"/"on" (case-insensitive) enable it.
+
+    Stricter than telemetry's `_env_flag` (which treats any non-false value as
+    true) because these flags weaken security, so a typo must not enable them.
+    """
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_csv_lower(name: str) -> frozenset[str]:
+    return frozenset(
+        item.strip().lower() for item in os.getenv(name, "").split(",") if item.strip()
+    )
 
 
 # Global instance placeholders for the singleton pattern
