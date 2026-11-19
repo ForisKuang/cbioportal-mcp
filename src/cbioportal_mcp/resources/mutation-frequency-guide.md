@@ -141,7 +141,9 @@ ORDER BY frequency_pct DESC;
 
 Returns `(cancer_type, altered_samples, profiled_samples, frequency_pct)` for every cancer type with ≥ 50 profiled samples for the gene in the cohort. The recipe works identically whether the preference resolves to 1 study or 242.
 
-The view is defined in `sql/4-mutation-frequency-views.sql` and handles the WES-vs-named-panel split internally (see "Why this works" below). The agent should prefer this view for any "gene X across cancer types in cohort Y" question instead of writing the JOIN chain by hand.
+The view handles the WES-vs-named-panel split internally (see "Why this works" below) and reads per-study aggregates precomputed at data-refresh time, so it returns in milliseconds even for large cohorts. The agent should prefer this view for any "gene X across cancer types in cohort Y" question instead of writing the JOIN chain by hand — a hand-written JOIN chain recomputes the same numbers from `genomic_event_derived` on every call and is much slower.
+
+All five frequency views in this guide (`gene_mutation_frequency_by_cancer_type`, `gene_mutation_frequency_in_study`, `gene_mutation_frequency_in_studies`, `gene_alteration_frequency_by_cancer_type`, `top_mutated_genes_in_cohort`) are precomputed this way. Each has a `*_live` twin that recomputes from the raw tables and returns identical numbers; you never need the `_live` views for answering questions.
 
 ### Variant: a single named study (`gene_mutation_frequency_in_study`)
 
@@ -216,9 +218,62 @@ Returns `(hugo_gene_symbol, altered_samples, profiled_samples, frequency_pct, to
 
 Gene expression / copy-number correlation questions ("are TP53 and MYC expression correlated in METABRIC?") belong in `cbioportal://gene-expression-guide`, which covers the `genetic_alteration_derived` table and the `gene_pair_coexpression(study, gene_a, gene_b, profile_type)` view. Don't try to express expression queries through the mutation-frequency views.
 
+### Variant: per-gene × per-cancer-type aggregates (`precomputed_*` tables)
+
+For questions the views don't take as a parameter but that still use the standard numerator/denominator — e.g. **top-N most-mutated genes per cancer type** — query the precomputed tables the views are built on instead of `genomic_event_derived`. They hold one row per (study, cancer type, gene) and the counts are **additive across studies** (sample IDs are study-scoped), so a cohort total is a `sum()`:
+
+```sql
+WITH cohort AS (
+    SELECT cancer_study_identifier FROM cancer_study_query_preferences
+    WHERE preference_name = 'pan_cancer_tcga'
+),
+altered AS (
+    SELECT cancer_type, hugo_gene_symbol, sum(altered_samples) AS altered_samples
+    FROM precomputed_alteration_altered_by_cancer_type
+    WHERE alteration = 'mutation'            -- or amplification / deep_deletion / structural_variant
+      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+    GROUP BY cancer_type, hugo_gene_symbol
+),
+wes AS (   -- WES samples: profiled for every gene
+    SELECT cancer_type, sum(profiled_samples) AS n
+    FROM precomputed_alteration_wes_profiled_by_cancer_type
+    WHERE alteration_type = 'MUTATION_EXTENDED'
+      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+    GROUP BY cancer_type
+),
+panel AS ( -- named-panel samples: profiled only for genes on their panel
+    SELECT cancer_type, hugo_gene_symbol, sum(profiled_samples) AS n
+    FROM precomputed_alteration_panel_profiled_by_cancer_type
+    WHERE alteration_type = 'MUTATION_EXTENDED'
+      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+    GROUP BY cancer_type, hugo_gene_symbol
+)
+SELECT cancer_type, hugo_gene_symbol, a.altered_samples AS altered_samples,
+       COALESCE(w.n, 0) + COALESCE(p.n, 0) AS profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(COALESCE(w.n, 0) + COALESCE(p.n, 0), 0), 1) AS frequency_pct
+FROM altered a
+LEFT JOIN wes w USING (cancer_type)
+LEFT JOIN panel p USING (cancer_type, hugo_gene_symbol)
+WHERE profiled_samples >= 50
+ORDER BY cancer_type, altered_samples DESC
+LIMIT 5 BY cancer_type;
+```
+
+Rules for these tables:
+- **Always add both halves of the denominator** (WES + panel). Panel rows exclude samples that also have WES coverage, so the sum is exact — never `COUNT(DISTINCT ...)` across them.
+- They cover the studies listed in `precomputed_frequency_studies`. If a study you need isn't there (rare — it means it was loaded after the last refresh), use the views above, which fall back to live computation automatically.
+- The top-N-per-cohort tables (`precomputed_mutation_*_by_study`) back `top_mutated_genes_in_cohort`; prefer that view.
+
+### Large tables: exact filters + study scoping
+
+`genomic_event_derived` (tens of millions of rows) is sorted by `(genetic_profile_stable_id, cancer_study_identifier, variant_type, entrez_gene_id, hugo_gene_symbol, ...)`, and `clinical_data_derived` by `(cancer_study_identifier, type, attribute_name, sample_unique_id)`. When you must query them directly:
+- **Always scope to studies** with `cancer_study_identifier = '...'` / `IN (SELECT cancer_study_identifier FROM cancer_study_query_preferences WHERE preference_name = '...')` — never scan all studies to answer a single-cohort question.
+- Use **exact equality** (`hugo_gene_symbol = 'TP53'`, `variant_type = 'mutation'`, `attribute_name = 'CANCER_TYPE'`), not `LIKE`, `lower()`, or `ILIKE` on these columns — functions on a column disable index pruning.
+- Prefer the views / `precomputed_*` tables above for any count that fits their numerator/denominator definition.
+
 ### When to drop down to the expanded CTE form
 
-For variations none of these three views cover (top-N most-mutated genes per cancer type, comparing two specific cancer types, custom alteration filters), drop down to the expanded CTE form below and adapt — but start from this CTE form, not a from-scratch JOIN chain that risks missing the WES branch:
+For variations neither the views nor the `precomputed_*` tables cover (custom alteration filters such as specific protein changes or mutation types, `CANCER_TYPE_DETAILED` grouping, patient-level counts), drop down to the expanded CTE form below and adapt — but start from this CTE form, not a from-scratch JOIN chain that risks missing the WES branch:
 
 ```sql
 WITH cohort AS (
@@ -273,10 +328,10 @@ ORDER BY frequency_pct DESC;
 ### Why this works
 - **`cancer_study_query_preferences` enforces a non-overlapping cohort.** Every shipped preference resolves to studies with no shared samples, so `COUNT(DISTINCT sample_unique_id)` doesn't double-count.
 - **`CANCER_TYPE` from `clinical_data_derived`, not `type_of_cancer_id` from `cancer_study`.** Multi-cancer-type studies (MSK-CHORD, MSK-IMPACT-50k, GENIE) carry `cancer_study.type_of_cancer_id = 'mixed'`; the per-sample diagnosis lives in the clinical data. Using the clinical attribute also works uniformly for single-cancer-type studies in the same cohort.
-- **WES-aware profiled denominator.** Samples on a named panel are profiled for the genes listed in `gene_panel_list`; WES samples are profiled for *every* gene. `WES` is not in the `gene_panel` table at all, so the older recipe that joined through `gene_panel` / `gene_panel_list` silently dropped WES rows — producing >100% frequencies wherever WES studies contributed altered samples but no profiled samples. The two views in `sql/4-mutation-frequency-views.sql` (`mutation_panel_gene_coverage` and `mutation_wes_coverage`) encapsulate this split so every gene-frequency query gets the WES branch for free via the `UNION ALL` above.
+- **WES-aware profiled denominator.** Samples on a named panel are profiled for the genes listed in `gene_panel_list`; WES samples are profiled for *every* gene. `WES` is not in the `gene_panel` table at all, so the older recipe that joined through `gene_panel` / `gene_panel_list` silently dropped WES rows — producing >100% frequencies wherever WES studies contributed altered samples but no profiled samples. The two coverage views (`mutation_panel_gene_coverage` and `mutation_wes_coverage`) encapsulate this split so every gene-frequency query gets the WES branch for free via the `UNION ALL` above.
 
 ### When to vary
-- **Top-N most-mutated genes per cancer type**: drop the `hugo_gene_symbol = '…'` filter and group by `(cancer_type, hugo_gene_symbol)`. Same CTEs.
+- **Top-N most-mutated genes per cancer type**: use the `precomputed_*` query above, not this CTE form.
 - **Comparing two specific cancer types**: filter `sct.cancer_type IN ('Cancer A', 'Cancer B')` after resolving via `search_oncotree`.
 - **Treatment-related cross-cancer questions**: switch to `preference_name = 'treatment_outcomes'` and pull treatment context from `clinical_event_derived` (see `treatment-guide`).
 
@@ -397,53 +452,23 @@ WHERE alteration_type = 'MUTATION_EXTENDED'
 
 ## Complete Analysis Example
 
-### Method 1: Automated Query (If Supported)
+For "most frequently mutated genes in study/cohort X", use `top_mutated_genes_in_cohort(preference, top_n)` for a shipped preference. For a single study that isn't a preference, sum the per-study precomputed tables (WES + panel denominators, as above):
+
 ```sql
--- Complete mutation frequency analysis with gene-specific denominators
-WITH mutation_counts AS (
-    SELECT
-        hugo_gene_symbol,
-        entrez_gene_id,
-        COUNT(DISTINCT sample_unique_id) AS numberOfAlteredSamples,
-        COUNT(DISTINCT CASE WHEN off_panel = 0 THEN sample_unique_id END) AS numberOfAlteredSamplesOnPanel,
-        COUNT(*) AS totalMutationEvents
-    FROM genomic_event_derived
-    WHERE
-        variant_type = 'mutation'
-        AND mutation_status != 'UNCALLED'
-        AND cancer_study_identifier = 'your_study_id'
-    GROUP BY entrez_gene_id, hugo_gene_symbol
-),
--- Gene-specific profiled samples
-profiled_counts AS (
-    SELECT
-        g.hugo_gene_symbol,
-        COUNT(DISTINCT stgp.sample_unique_id) as gene_profiled_samples
-    FROM sample_to_gene_panel_derived stgp
-    JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
-    JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
-    JOIN gene g ON gpl.gene_id = g.entrez_gene_id
-    WHERE
-        stgp.alteration_type = 'MUTATION_EXTENDED'
-        AND stgp.cancer_study_identifier = 'your_study_id'
-    GROUP BY g.hugo_gene_symbol
-)
--- Calculate frequencies with proper denominators
-SELECT
-    m.hugo_gene_symbol,
-    m.totalMutationEvents as mutations,
-    m.numberOfAlteredSamplesOnPanel as altered_samples,
-    p.gene_profiled_samples as profiled_samples,
-    ROUND((m.numberOfAlteredSamplesOnPanel * 100.0) / p.gene_profiled_samples, 1) as sample_frequency_percent
-FROM mutation_counts m
-JOIN profiled_counts p ON m.hugo_gene_symbol = p.hugo_gene_symbol
-ORDER BY sample_frequency_percent DESC;
+SELECT hugo_gene_symbol,
+       a.total_mutation_events AS mutations,
+       a.altered_samples AS altered_samples,
+       COALESCE(w.profiled_samples, 0) + COALESCE(p.profiled_samples, 0) AS profiled_samples,
+       ROUND(a.altered_samples * 100.0 / NULLIF(COALESCE(w.profiled_samples, 0) + COALESCE(p.profiled_samples, 0), 0), 1) AS sample_frequency_percent
+FROM precomputed_mutation_altered_by_study a
+LEFT JOIN precomputed_mutation_wes_profiled_by_study w USING (cancer_study_identifier)
+LEFT JOIN precomputed_mutation_panel_profiled_by_study p USING (cancer_study_identifier, hugo_gene_symbol)
+WHERE a.cancer_study_identifier = 'your_study_id'
+ORDER BY altered_samples DESC, hugo_gene_symbol
+LIMIT 20;
 ```
 
-### Method 2: Manual Per-Gene Queries (More Reliable)
-**Step 1**: Get top mutated genes
-**Step 2**: For each gene, run individual profiling query
-**Step 3**: Combine results manually with proper denominators
+Do **not** build an all-gene denominator by joining `sample_to_gene_panel_derived` through `gene_panel` / `gene_panel_list` alone: `WES` is not a row in `gene_panel`, so every WES sample silently drops out of the denominator.
 
 ## Important Notes
 
