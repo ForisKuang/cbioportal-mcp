@@ -15,8 +15,9 @@ SQL scripts in `sql/` directory (numeric prefix = apply order; see `sql/README.m
 - `1-add-column-comments.sql` - Adds helpful column comments
 - `2-add-oncotree-fields.sql` - Denormalizes OncoTree onto `type_of_cancer`
 - `3-add-cancer-study-query-preferences.sql` - Creates the cohort-lookup table
-- `4-mutation-frequency-views.sql` - WES-aware views for mutation-frequency denominators + parameterized `gene_mutation_frequency_by_cancer_type(preference, gene)` recipe view + `top_mutated_genes_in_cohort`
+- `4-mutation-frequency-views.sql` - WES-aware coverage views for mutation-frequency denominators + the live (recompute-on-read) `*_live` recipe views, e.g. `gene_mutation_frequency_by_cancer_type_live(preference, gene)`, `top_mutated_genes_in_cohort_live`
 - `5-gene-expression-views.sql` - Expression / copy-number-value / methylation views (`gene_pair_coexpression`); backed by `genetic_alteration_derived`
+- `6-precomputed-mutation-frequency.sql` - Per-study `precomputed_*` aggregate tables rebuilt at data-refresh time (staging + `EXCHANGE TABLES`), plus the agent-facing frequency views over them with a live fallback. The `*_live` views in file 4 are the reference definitions; `scripts/check_precomputed_parity.sh` checks they agree
 - `portal-specific/<portal-name>/*.sql` - Deployment-specific cohorts (e.g. `portal-specific/public-portal/0-preferences.sql`). Existence-gated so they're no-ops on other deployments.
 
 **Example**: The `sample.sample_type` column contained "Primary Solid Tumor" for ALL samples, causing agents to report wrong counts for "primary samples". Solution: Remove the column entirely.
@@ -132,14 +133,16 @@ sql/
 ├── 1-add-column-comments.sql                    # Add helpful column comments
 ├── 2-add-oncotree-fields.sql                    # Denormalize OncoTree onto type_of_cancer
 ├── 3-add-cancer-study-query-preferences.sql     # cancer_study_query_preferences table + portable preferences
-├── 4-mutation-frequency-views.sql                # Mutation-frequency parameterized views + coverage building blocks
+├── 4-mutation-frequency-views.sql                # Coverage building blocks + *_live frequency recipe views
 ├── 5-gene-expression-views.sql                   # Expression / CN / methylation correlation views
+├── 6-precomputed-mutation-frequency.sql          # precomputed_* frequency tables + agent-facing views (live fallback)
 └── portal-specific/                             # Deployment-specific preferences (iterated after portable files)
     └── public-portal/
         └── 0-preferences.sql                    # cbioportal.org cohort rows (gated, no-op elsewhere)
 
 scripts/
-└── apply_sql.sh                                 # Apply all sql/*.sql in order against admin creds
+├── apply_sql.sh                                 # Apply all sql/*.sql in order against admin creds
+└── check_precomputed_parity.sh                  # Read-only: precomputed views vs *_live views
 
 resources/
 ├── mutation-frequency-guide.md    # How to calculate frequencies

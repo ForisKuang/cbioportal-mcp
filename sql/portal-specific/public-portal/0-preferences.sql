@@ -5,7 +5,7 @@
 -- These rows describe which studies to use for which kind of question on
 -- the *public* cBioPortal deployment. Lives under sql/portal-specific/ so
 -- the boundary between "portable to any deployment" (sql/0-* through
--- sql/4-*) and "tied to a specific portal" is a directory, not a number.
+-- sql/6-*) and "tied to a specific portal" is a directory, not a number.
 --
 -- Other deployments should either:
 --   1. Add their own sql/portal-specific/<their-name>/*.sql files alongside
@@ -21,8 +21,14 @@
 --
 -- Preferences defined here (all defensively existence-checked):
 --   all_studies_non_redundant  — the 242-study curated set from cBioPortal's
---                                --skin.quick_select_buttons. Default for
---                                "across cancer types" questions.
+--                                --skin.quick_select_buttons. NOT the default:
+--                                use only when the user explicitly asks for
+--                                broader-than-TCGA coverage (CANCER_TYPE labels
+--                                are not normalized across these studies). The
+--                                default for "across cancer types" questions is
+--                                pan_cancer_tcga (sql/3-*), as stated in
+--                                cbioportal://mutation-frequency-guide and the
+--                                system prompt.
 --   large_genomic_cohort       — msk_impact_50k_2026. Genomic-pattern
 --                                questions at maximum statistical power.
 --   treatment_outcomes         — msk_chord_2024. Treatment / outcomes
