@@ -4,8 +4,10 @@
 -- This file is the mutation side of the agent's gene-frequency API:
 --   - Two coverage building-block views (`mutation_panel_gene_coverage`,
 --     `mutation_wes_coverage`).
---   - Parameterized "frequency by cancer type for cohort Y" recipe.
---   - Parameterized "top-N most-mutated genes in cohort" recipe.
+--   - The LIVE (recompute-on-read) parameterized frequency recipes,
+--     suffixed `_live`. The agent-facing names without the suffix are
+--     created in sql/6-precomputed-mutation-frequency.sql on top of
+--     per-study aggregates materialized at data-refresh time.
 --
 -- Sibling files in this directory:
 --   sql/5-gene-expression-views.sql — gene_pair_coexpression and any
@@ -74,80 +76,96 @@ WHERE alteration_type = 'MUTATION_EXTENDED'
   AND gene_panel_id = 'WES';
 
 -- ============================================================================
--- gene_mutation_frequency_by_cancer_type — parameterized full recipe
+-- Live (recompute-on-read) frequency recipes: *_live views
 -- ============================================================================
--- The agent's canonical "gene X mutation frequency across cancer types in
--- cohort Y" computation, exposed as a parameterized view so the agent
--- doesn't have to write (and can't get wrong) the JOIN chain.
+-- These five parameterized views are the REFERENCE definition of every
+-- mutation / alteration frequency number the agent reports. They recompute
+-- the event × clinical × panel-coverage joins on every read.
 --
--- Parameters:
---   preference  — a row in cancer_study_query_preferences.preference_name.
---                 Default is 'pan_cancer_tcga' (32 TCGA PanCancer Atlas
---                 studies, consistent labels, balanced sample sizes,
---                 canonical published reference). Other shipped values:
---                 'large_genomic_cohort' (msk_impact_50k_2026 — biggest
---                 single MSK cohort), 'treatment_outcomes' (msk_chord_2024
---                 — treatment-rich), and 'all_studies_non_redundant' (242
---                 studies, use sparingly — see mutation-frequency-guide;
---                 CANCER_TYPE labels are not normalized across studies).
---   gene        — HUGO gene symbol (e.g. 'TP53', 'KRAS')
+-- The agent-facing names WITHOUT the `_live` suffix
+-- (gene_mutation_frequency_by_cancer_type, gene_mutation_frequency_in_study,
+-- gene_mutation_frequency_in_studies, gene_alteration_frequency_by_cancer_type,
+-- top_mutated_genes_in_cohort) are defined in
+-- sql/6-precomputed-mutation-frequency.sql. They return numerically
+-- identical results but read per-study aggregates materialized at
+-- data-refresh time, and fall back to this live logic only for studies
+-- missing from the precompute. scripts/check_precomputed_parity.sql
+-- compares the two.
 --
--- Usage:
---   SELECT *
---   FROM gene_mutation_frequency_by_cancer_type(
---       preference='pan_cancer_tcga',
---       gene='TP53'
---   )
---   ORDER BY frequency_pct DESC;
+-- Keep the counting rules here and in sql/6-* in sync: any change to the
+-- numerator / denominator definition must be made in BOTH files, and the
+-- parity script re-run.
 --
--- Returns one row per cancer type with at least 50 profiled samples for
--- the gene in the cohort: (cancer_type, altered_samples,
--- profiled_samples, frequency_pct).
---
--- ClickHouse parameterized views (23.1+) are the documented equivalent
--- of stored procedures for reusable parameterized SELECTs — see
--- https://clickhouse.com/docs/guides/developer/stored-procedures-and-prepared-statements
+-- Pruning notes (ClickHouse sorting keys, checked against the public
+-- deployment's system.tables):
+--   genomic_event_derived         ORDER BY (genetic_profile_stable_id,
+--                                  cancer_study_identifier, variant_type,
+--                                  entrez_gene_id, hugo_gene_symbol, ...)
+--   clinical_data_derived         ORDER BY (cancer_study_identifier, type,
+--                                  attribute_name, sample_unique_id)
+--   sample_to_gene_panel_derived  ORDER BY (gene_panel_id, alteration_type,
+--                                  genetic_profile_id, sample_unique_id)
+-- so every branch below filters genomic_event_derived on the cohort's
+-- genetic_profile_stable_id set (resolved via genetic_profile, which holds
+-- every profile referenced by genomic_event_derived) AND on
+-- cancer_study_identifier, and filters clinical_data_derived /
+-- coverage branches on cancer_study_identifier directly instead of only
+-- via a post-hoc JOIN. These predicates are redundant with the cohort
+-- JOIN semantics — they never change results, only how much is read.
 -- ============================================================================
 
-DROP VIEW IF EXISTS gene_mutation_frequency_by_cancer_type;
+-- ----------------------------------------------------------------------------
+-- gene_mutation_frequency_by_cancer_type_live(preference, gene)
+-- ----------------------------------------------------------------------------
+DROP VIEW IF EXISTS gene_mutation_frequency_by_cancer_type_live;
 
-CREATE VIEW gene_mutation_frequency_by_cancer_type AS
+CREATE VIEW gene_mutation_frequency_by_cancer_type_live AS
 WITH cohort AS (
     SELECT cancer_study_identifier
     FROM cancer_study_query_preferences
     WHERE preference_name = {preference:String}
 ),
+cohort_profiles AS (
+    SELECT gp.stable_id
+    FROM genetic_profile gp
+    WHERE gp.cancer_study_id IN (
+        SELECT cs.cancer_study_id FROM cancer_study cs
+        WHERE cs.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+    )
+),
 sample_cancer_type AS (
     SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
     FROM clinical_data_derived cd
-    JOIN cohort c USING (cancer_study_identifier)
-    WHERE cd.attribute_name = 'CANCER_TYPE'
+    WHERE cd.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+      AND cd.attribute_name = 'CANCER_TYPE'
 ),
 altered AS (
     SELECT sct.cancer_type,
            COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
     FROM genomic_event_derived ged
-    JOIN cohort c USING (cancer_study_identifier)
     JOIN sample_cancer_type sct USING (sample_unique_id)
-    WHERE ged.variant_type = 'mutation'
+    WHERE ged.genetic_profile_stable_id IN (SELECT stable_id FROM cohort_profiles)
+      AND ged.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+      AND ged.variant_type = 'mutation'
       AND ged.mutation_status != 'UNCALLED'
       AND ged.hugo_gene_symbol = {gene:String}
       AND ged.off_panel = 0
     GROUP BY sct.cancer_type
 ),
 profiled_samples_for_gene AS (
-    SELECT sample_unique_id, cancer_study_identifier
+    SELECT sample_unique_id
     FROM mutation_panel_gene_coverage
     WHERE hugo_gene_symbol = {gene:String}
+      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
     UNION ALL
-    SELECT sample_unique_id, cancer_study_identifier
+    SELECT sample_unique_id
     FROM mutation_wes_coverage
+    WHERE cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
 ),
 profiled AS (
     SELECT sct.cancer_type,
            COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
     FROM profiled_samples_for_gene p
-    JOIN cohort c USING (cancer_study_identifier)
     JOIN sample_cancer_type sct USING (sample_unique_id)
     GROUP BY sct.cancer_type
 )
@@ -159,38 +177,21 @@ FROM altered a
 JOIN profiled p USING (cancer_type)
 WHERE p.profiled_samples >= 50;
 
+-- ----------------------------------------------------------------------------
+-- gene_mutation_frequency_in_study_live(study, gene)
+-- ----------------------------------------------------------------------------
+DROP VIEW IF EXISTS gene_mutation_frequency_in_study_live;
 
-
--- ============================================================================
--- gene_mutation_frequency_in_study — per-study mutation frequency
--- ============================================================================
--- Same recipe as gene_mutation_frequency_by_cancer_type, but scoped to one
--- explicit study instead of a cohort lookup. Use when the user names a
--- specific study and that study isn't part of a shipped preference.
---
--- Parameters:
---   study  — a cancer_study.cancer_study_identifier
---            (e.g. 'brca_metabric', 'lung_msk_2017')
---   gene   — HUGO gene symbol (e.g. 'TP53', 'KRAS')
---
--- Usage:
---   SELECT *
---   FROM gene_mutation_frequency_in_study(
---       study='brca_metabric',
---       gene='TP53'
---   )
---   ORDER BY frequency_pct DESC;
---
--- For single-cancer-type studies (most named studies), returns one row.
--- For multi-cancer studies that carry a per-sample `CANCER_TYPE`
--- attribute (e.g. msk_chord_2024), returns one row per cancer type with
--- ≥ 50 profiled samples.
--- ============================================================================
-
-DROP VIEW IF EXISTS gene_mutation_frequency_in_study;
-
-CREATE VIEW gene_mutation_frequency_in_study AS
-WITH sample_cancer_type AS (
+CREATE VIEW gene_mutation_frequency_in_study_live AS
+WITH study_profiles AS (
+    SELECT gp.stable_id
+    FROM genetic_profile gp
+    WHERE gp.cancer_study_id IN (
+        SELECT cs.cancer_study_id FROM cancer_study cs
+        WHERE cs.cancer_study_identifier = {study:String}
+    )
+),
+sample_cancer_type AS (
     SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
     FROM clinical_data_derived cd
     WHERE cd.cancer_study_identifier = {study:String}
@@ -201,7 +202,8 @@ altered AS (
            COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
     FROM genomic_event_derived ged
     JOIN sample_cancer_type sct USING (sample_unique_id)
-    WHERE ged.cancer_study_identifier = {study:String}
+    WHERE ged.genetic_profile_stable_id IN (SELECT stable_id FROM study_profiles)
+      AND ged.cancer_study_identifier = {study:String}
       AND ged.variant_type = 'mutation'
       AND ged.mutation_status != 'UNCALLED'
       AND ged.hugo_gene_symbol = {gene:String}
@@ -209,12 +211,12 @@ altered AS (
     GROUP BY sct.cancer_type
 ),
 profiled_samples_for_gene AS (
-    SELECT sample_unique_id, cancer_study_identifier
+    SELECT sample_unique_id
     FROM mutation_panel_gene_coverage
     WHERE hugo_gene_symbol = {gene:String}
       AND cancer_study_identifier = {study:String}
     UNION ALL
-    SELECT sample_unique_id, cancer_study_identifier
+    SELECT sample_unique_id
     FROM mutation_wes_coverage
     WHERE cancer_study_identifier = {study:String}
 ),
@@ -233,39 +235,21 @@ FROM altered a
 JOIN profiled p USING (cancer_type)
 WHERE p.profiled_samples >= 50;
 
--- ============================================================================
--- gene_mutation_frequency_in_studies — ad-hoc cohort of named studies
--- ============================================================================
--- Same recipe as gene_mutation_frequency_in_study, but takes an Array of
--- study ids. Use when the user names a handful of studies that aren't a
--- shipped preference and there's no time to add one — e.g. "TP53 in
--- METABRIC, MSK-IMPACT, and Pan-LungCancer".
---
--- IMPORTANT: this is your responsibility, not the view's: the studies
--- you pass must NOT share samples. Sample IDs are study-prefixed
--- (cancer_study_id_ + sample.stable_id), so the same physical sample
--- in two studies will count twice and you can get >100% frequencies.
--- The shipped preferences (`all_studies_non_redundant`, `pan_cancer_tcga`)
--- are vetted to be non-overlapping; ad-hoc lists are not.
---
--- Parameters:
---   studies  — Array(String) of cancer_study_identifier values
---              (e.g. ['brca_metabric', 'brca_tcga_pan_can_atlas_2018'])
---   gene     — HUGO gene symbol
---
--- Usage:
---   SELECT *
---   FROM gene_mutation_frequency_in_studies(
---       studies=['brca_metabric','brca_tcga_pan_can_atlas_2018'],
---       gene='TP53'
---   )
---   ORDER BY frequency_pct DESC;
--- ============================================================================
+-- ----------------------------------------------------------------------------
+-- gene_mutation_frequency_in_studies_live(studies, gene)
+-- ----------------------------------------------------------------------------
+DROP VIEW IF EXISTS gene_mutation_frequency_in_studies_live;
 
-DROP VIEW IF EXISTS gene_mutation_frequency_in_studies;
-
-CREATE VIEW gene_mutation_frequency_in_studies AS
-WITH sample_cancer_type AS (
+CREATE VIEW gene_mutation_frequency_in_studies_live AS
+WITH studies_profiles AS (
+    SELECT gp.stable_id
+    FROM genetic_profile gp
+    WHERE gp.cancer_study_id IN (
+        SELECT cs.cancer_study_id FROM cancer_study cs
+        WHERE cs.cancer_study_identifier IN {studies:Array(String)}
+    )
+),
+sample_cancer_type AS (
     SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
     FROM clinical_data_derived cd
     WHERE cd.cancer_study_identifier IN {studies:Array(String)}
@@ -276,7 +260,8 @@ altered AS (
            COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
     FROM genomic_event_derived ged
     JOIN sample_cancer_type sct USING (sample_unique_id)
-    WHERE ged.cancer_study_identifier IN {studies:Array(String)}
+    WHERE ged.genetic_profile_stable_id IN (SELECT stable_id FROM studies_profiles)
+      AND ged.cancer_study_identifier IN {studies:Array(String)}
       AND ged.variant_type = 'mutation'
       AND ged.mutation_status != 'UNCALLED'
       AND ged.hugo_gene_symbol = {gene:String}
@@ -284,12 +269,12 @@ altered AS (
     GROUP BY sct.cancer_type
 ),
 profiled_samples_for_gene AS (
-    SELECT sample_unique_id, cancer_study_identifier
+    SELECT sample_unique_id
     FROM mutation_panel_gene_coverage
     WHERE hugo_gene_symbol = {gene:String}
       AND cancer_study_identifier IN {studies:Array(String)}
     UNION ALL
-    SELECT sample_unique_id, cancer_study_identifier
+    SELECT sample_unique_id
     FROM mutation_wes_coverage
     WHERE cancer_study_identifier IN {studies:Array(String)}
 ),
@@ -308,62 +293,45 @@ FROM altered a
 JOIN profiled p USING (cancer_type)
 WHERE p.profiled_samples >= 50;
 
--- ============================================================================
--- gene_alteration_frequency_by_cancer_type — generalize to CNA + SV
--- ============================================================================
--- gene_mutation_frequency_by_cancer_type only handles point mutations.
--- This view generalizes the same recipe to copy-number alterations
--- (amplification / deep deletion) and structural variants. The recipe is
--- identical to the mutation case, with two differences:
---   - numerator filter switches based on the alteration kind
---   - denominator looks up samples profiled for the matching
---     alteration_type in sample_to_gene_panel_derived
---     (MUTATION_EXTENDED / COPY_NUMBER_ALTERATION / STRUCTURAL_VARIANT)
---
--- Parameters:
---   preference  — cancer_study_query_preferences.preference_name (same as
---                 gene_mutation_frequency_by_cancer_type)
---   gene        — HUGO gene symbol
---   alteration  — one of:
---                   'mutation'           — point mutations (UNCALLED excluded)
---                   'amplification'      — CNA == +2 (high-level amp)
---                   'deep_deletion'      — CNA == -2 (homozygous deletion)
---                   'structural_variant' — fusion / SV
---
--- Usage:
---   SELECT * FROM gene_alteration_frequency_by_cancer_type(
---       preference='pan_cancer_tcga', gene='MYC', alteration='amplification'
---   ) ORDER BY frequency_pct DESC;
---
--- Returns the same columns as gene_mutation_frequency_by_cancer_type:
--- (cancer_type, altered_samples, profiled_samples, frequency_pct).
---
--- For point mutations the result equals the mutation-only view;
--- gene_mutation_frequency_by_cancer_type is kept as the cleaner
--- shorthand for that case.
--- ============================================================================
+-- ----------------------------------------------------------------------------
+-- gene_alteration_frequency_by_cancer_type_live(preference, gene, alteration)
+-- ----------------------------------------------------------------------------
+-- alteration token → numerator filter / denominator alteration_type:
+--   'mutation'           variant_type='mutation' AND mutation_status!='UNCALLED' / MUTATION_EXTENDED
+--   'amplification'      variant_type='cna' AND cna_alteration=2                 / COPY_NUMBER_ALTERATION
+--   'deep_deletion'      variant_type='cna' AND cna_alteration=-2                / COPY_NUMBER_ALTERATION
+--   'structural_variant' variant_type='structural_variant'                       / STRUCTURAL_VARIANT
+-- ----------------------------------------------------------------------------
+DROP VIEW IF EXISTS gene_alteration_frequency_by_cancer_type_live;
 
-DROP VIEW IF EXISTS gene_alteration_frequency_by_cancer_type;
-
-CREATE VIEW gene_alteration_frequency_by_cancer_type AS
+CREATE VIEW gene_alteration_frequency_by_cancer_type_live AS
 WITH cohort AS (
     SELECT cancer_study_identifier
     FROM cancer_study_query_preferences
     WHERE preference_name = {preference:String}
 ),
+cohort_profiles AS (
+    SELECT gp.stable_id
+    FROM genetic_profile gp
+    WHERE gp.cancer_study_id IN (
+        SELECT cs.cancer_study_id FROM cancer_study cs
+        WHERE cs.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+    )
+),
 sample_cancer_type AS (
     SELECT cd.sample_unique_id, cd.attribute_value AS cancer_type
     FROM clinical_data_derived cd
-    JOIN cohort c USING (cancer_study_identifier)
-    WHERE cd.attribute_name = 'CANCER_TYPE'
+    WHERE cd.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+      AND cd.attribute_name = 'CANCER_TYPE'
 ),
 altered AS (
     SELECT sct.cancer_type,
            COUNT(DISTINCT ged.sample_unique_id) AS altered_samples
     FROM genomic_event_derived ged
-    JOIN cohort c USING (cancer_study_identifier)
     JOIN sample_cancer_type sct USING (sample_unique_id)
-    WHERE ged.hugo_gene_symbol = {gene:String}
+    WHERE ged.genetic_profile_stable_id IN (SELECT stable_id FROM cohort_profiles)
+      AND ged.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+      AND ged.hugo_gene_symbol = {gene:String}
       AND ged.off_panel = 0
       AND (
         ({alteration:String} = 'mutation'
@@ -381,15 +349,13 @@ altered AS (
     GROUP BY sct.cancer_type
 ),
 profiled_samples_for_gene AS (
-    -- Map the user-facing alteration token to the alteration_type stored
-    -- on sample_to_gene_panel_derived. Same gene-in-panel-or-WES branch
-    -- as the mutation view, but with the matching alteration_type filter.
-    SELECT stgp.sample_unique_id, stgp.cancer_study_identifier
+    SELECT stgp.sample_unique_id
     FROM sample_to_gene_panel_derived stgp
     JOIN gene_panel gp ON stgp.gene_panel_id = gp.stable_id
     JOIN gene_panel_list gpl ON gp.internal_id = gpl.internal_id
     JOIN gene g ON gpl.gene_id = g.entrez_gene_id
     WHERE g.hugo_gene_symbol = {gene:String}
+      AND stgp.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
       AND stgp.alteration_type = multiIf(
           {alteration:String} = 'mutation',           'MUTATION_EXTENDED',
           {alteration:String} = 'amplification',      'COPY_NUMBER_ALTERATION',
@@ -397,9 +363,10 @@ profiled_samples_for_gene AS (
           {alteration:String} = 'structural_variant', 'STRUCTURAL_VARIANT',
           '')
     UNION ALL
-    SELECT sample_unique_id, cancer_study_identifier
+    SELECT sample_unique_id
     FROM sample_to_gene_panel_derived
     WHERE gene_panel_id = 'WES'
+      AND cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
       AND alteration_type = multiIf(
           {alteration:String} = 'mutation',           'MUTATION_EXTENDED',
           {alteration:String} = 'amplification',      'COPY_NUMBER_ALTERATION',
@@ -411,7 +378,6 @@ profiled AS (
     SELECT sct.cancer_type,
            COUNT(DISTINCT p.sample_unique_id) AS profiled_samples
     FROM profiled_samples_for_gene p
-    JOIN cohort c USING (cancer_study_identifier)
     JOIN sample_cancer_type sct USING (sample_unique_id)
     GROUP BY sct.cancer_type
 )
@@ -423,58 +389,41 @@ FROM altered a
 JOIN profiled p USING (cancer_type)
 WHERE p.profiled_samples >= 50;
 
--- ============================================================================
--- top_mutated_genes_in_cohort — top-N most-mutated genes in a cohort
--- ============================================================================
--- Mirrors cbioportal-backend's StudyViewMapper.getMutatedGenes, but with
--- a WES-aware gene-specific profiled denominator (so the percentage
--- reflects real biology instead of being inflated for low-coverage
--- genes).
---
--- The trick to keeping this cheap at cohort scale: WES samples are
--- profiled for ALL genes, so their count is a single number per cohort
--- (computed once). For named-panel samples, profiled count is per-gene
--- and only needs to include the genes the panel actually lists. We
--- compute these two pieces separately and add them per gene.
---
--- Parameters:
---   preference  — cancer_study_query_preferences.preference_name
---                 (e.g. 'pan_cancer_tcga' default; see
---                 gene_mutation_frequency_by_cancer_type docstring)
---   top_n       — UInt32, max number of genes to return
---                 (e.g. 20 for the typical "top 20 mutated genes" question)
---
--- Usage:
---   SELECT *
---   FROM top_mutated_genes_in_cohort(
---       preference='pan_cancer_tcga',
---       top_n=20
---   );
---
--- Returns one row per gene: (hugo_gene_symbol, altered_samples,
--- profiled_samples, frequency_pct, total_mutation_events). Sorted by
--- altered_samples DESC, then hugo_gene_symbol ASC (same as backend).
--- ============================================================================
+-- ----------------------------------------------------------------------------
+-- top_mutated_genes_in_cohort_live(preference, top_n)
+-- ----------------------------------------------------------------------------
+-- Mirrors cbioportal-backend's StudyViewMapper.getMutatedGenes with a
+-- WES-aware per-gene denominator: WES samples are profiled for every gene
+-- (one number per cohort); named-panel samples are profiled only for the
+-- genes their panel lists. The two pieces are added per gene (not
+-- DISTINCT-unioned — this matches the backend; the precomputed view in
+-- sql/6-* reproduces the same additive formula).
+-- ----------------------------------------------------------------------------
+DROP VIEW IF EXISTS top_mutated_genes_in_cohort_live;
 
-DROP VIEW IF EXISTS top_mutated_genes_in_cohort;
-
-CREATE VIEW top_mutated_genes_in_cohort AS
+CREATE VIEW top_mutated_genes_in_cohort_live AS
 WITH cohort AS (
     SELECT cancer_study_identifier
     FROM cancer_study_query_preferences
     WHERE preference_name = {preference:String}
 ),
+cohort_profiles AS (
+    SELECT gp.stable_id
+    FROM genetic_profile gp
+    WHERE gp.cancer_study_id IN (
+        SELECT cs.cancer_study_id FROM cancer_study cs
+        WHERE cs.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+    )
+),
 wes_profiled_count AS (
-    -- WES samples are profiled for every gene; one number for the cohort.
     SELECT COUNT(DISTINCT w.sample_unique_id) AS n
     FROM mutation_wes_coverage w
-    JOIN cohort c USING (cancer_study_identifier)
+    WHERE w.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
 ),
 panel_profiled_per_gene AS (
-    -- For each gene, count cohort samples on a named panel that lists it.
     SELECT mpgc.hugo_gene_symbol, COUNT(DISTINCT mpgc.sample_unique_id) AS n
     FROM mutation_panel_gene_coverage mpgc
-    JOIN cohort c USING (cancer_study_identifier)
+    WHERE mpgc.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
     GROUP BY mpgc.hugo_gene_symbol
 ),
 altered_per_gene AS (
@@ -482,8 +431,9 @@ altered_per_gene AS (
            COUNT(DISTINCT ged.sample_unique_id) AS altered_samples,
            COUNT(*) AS total_mutation_events
     FROM genomic_event_derived ged
-    JOIN cohort c USING (cancer_study_identifier)
-    WHERE ged.variant_type = 'mutation'
+    WHERE ged.genetic_profile_stable_id IN (SELECT stable_id FROM cohort_profiles)
+      AND ged.cancer_study_identifier IN (SELECT cancer_study_identifier FROM cohort)
+      AND ged.variant_type = 'mutation'
       AND ged.mutation_status != 'UNCALLED'
       AND ged.off_panel = 0
     GROUP BY ged.hugo_gene_symbol
@@ -497,4 +447,3 @@ FROM altered_per_gene a
 LEFT JOIN panel_profiled_per_gene p USING (hugo_gene_symbol)
 ORDER BY altered_samples DESC, hugo_gene_symbol ASC
 LIMIT {top_n:UInt32};
-
