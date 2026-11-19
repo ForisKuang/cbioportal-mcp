@@ -1,9 +1,9 @@
 """Environment configuration for cBioPortal MCP server."""
 
-from dataclasses import dataclass
 import os
-from typing import Optional
+from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
 class TransportType(str, Enum):
@@ -143,6 +143,66 @@ class McpConfig:
         """
         value = os.getenv("CBIOPORTAL_MCP_GOOGLE_BASE_URL")
         return value if value else None
+
+    @property
+    def query_timeout_seconds(self) -> int:
+        """Client-side query timeout in seconds (also default HTTP read timeout).
+
+        Default: 30 (kept above max_execution_time_seconds so ClickHouse cancels
+        slow queries server-side before the client socket times out).
+        """
+        return max(1, int(os.getenv("CBIOPORTAL_MCP_QUERY_TIMEOUT", "30")))
+
+    @property
+    def max_execution_time_seconds(self) -> int:
+        """ClickHouse server-side ``max_execution_time`` setting in seconds.
+
+        Default: 25 (strictly below the default 30s client timeout so ClickHouse
+        terminates slow queries server-side instead of letting them run until
+        ``send_receive_timeout``). Set to 0 to disable.
+        """
+        return max(0, int(os.getenv("CBIOPORTAL_MCP_MAX_EXECUTION_TIME", "25")))
+
+    @property
+    def max_result_rows(self) -> int:
+        """ClickHouse server-side ``max_result_rows`` setting (used with
+        ``result_overflow_mode='break'``).
+
+        Default: 10000. Set to 0 to disable.
+        """
+        return max(0, int(os.getenv("CBIOPORTAL_MCP_MAX_RESULT_ROWS", "10000")))
+
+    @property
+    def max_result_bytes(self) -> int:
+        """ClickHouse server-side ``max_result_bytes`` setting in bytes (used with
+        ``result_overflow_mode='break'``).
+
+        Default: 50000000 (~50 MB). Set to 0 to disable.
+        """
+        return max(0, int(os.getenv("CBIOPORTAL_MCP_MAX_RESULT_BYTES", "50000000")))
+
+    @property
+    def max_returned_rows(self) -> int:
+        """Maximum rows returned to the LLM by ``clickhouse_run_select_query``.
+
+        When a query returns more rows than this cap, only the first
+        ``max_returned_rows`` rows are returned along with ``truncated: true``
+        and a guidance message.
+
+        Default: 1000. Set to 0 to disable client-side row capping.
+        """
+        return max(0, int(os.getenv("CBIOPORTAL_MCP_MAX_ROWS", "1000")))
+
+    @property
+    def llmobs_max_output_chars(self) -> int:
+        """Maximum characters of tool output attached to Datadog LLMObs spans.
+
+        Outputs exceeding this limit are truncated without running ``json.dumps``
+        on the full result payload. Set to 0 to omit output capture completely.
+
+        Default: 16384.
+        """
+        return max(0, int(os.getenv("CBIOPORTAL_MCP_LLMOBS_MAX_OUTPUT_CHARS", "16384")))
 
 
 # Global instance placeholders for the singleton pattern

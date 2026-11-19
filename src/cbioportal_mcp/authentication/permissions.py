@@ -18,12 +18,12 @@ If checks fail, we raise PermissionError so the application can fail fast.
 from __future__ import annotations
 
 import logging
-import os
-from typing import Any, Dict, List
+from typing import List
 
-from cbioportal_mcp.env import McpConfig
-from mcp_clickhouse.mcp_server import execute_query
 from fastmcp.exceptions import ToolError
+
+from cbioportal_mcp.clickhouse import execute_query
+from cbioportal_mcp.env import McpConfig
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def _check_grant(priv: str, scope: str) -> bool:
         scope = "*.*"
 
     try:
-        raw = execute_query(f"CHECK GRANT {priv} ON {scope}")
+        raw = execute_query(f"CHECK GRANT {priv} ON {scope}", query_label="permissions.check_grant")
     except ToolError as e:
         logger.warning(
             "CHECK GRANT %s ON %s failed (treating as not granted): %s",

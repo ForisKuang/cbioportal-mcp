@@ -8,7 +8,10 @@ import logging
 import os
 import socket
 import time
+import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 import mcp.types as mt
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -18,10 +21,13 @@ from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from cbioportal_mcp.env import get_mcp_config
+
 logger = logging.getLogger(__name__)
 
 _tracer_provider: TracerProvider | None = None
 _dogstatsd_client: "_DogStatsDClient | None" = None
+_current_tool_name: ContextVar[str | None] = ContextVar("cbioportal_mcp_current_tool", default=None)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -172,20 +178,131 @@ def _emit_db_query_metrics(
         logger.debug("DogStatsD db_query metric emit failed: %s", exc)
 
 
+def _emit_db_client_setup_metrics(
+    *,
+    duration_ms: float,
+    success: bool,
+) -> None:
+    """Emit aggregate Datadog metrics for ClickHouse client initialization/reconnect,
+    kept separate from ``db_query.duration_ms`` so cold-start or reconnect handshake
+    overhead isn't conflated with query execution time."""
+    client = _get_dogstatsd_client()
+    if client is None:
+        return
+
+    tags = {"success": str(success).lower()}
+    try:
+        client.increment("db_client.connects", tags)
+        client.distribution("db_client.setup_duration_ms", round(duration_ms, 3), tags)
+        if not success:
+            client.increment("db_client.errors", tags)
+    except Exception as exc:
+        logger.debug("DogStatsD db_client metric emit failed: %s", exc)
+
+
+@dataclass(frozen=True)
+class DbQueryContext:
+    """Correlation metadata for a single ClickHouse query execution."""
+
+    span: trace.Span
+    query_label: str
+    query_id: str
+    trace_id: str | None
+    span_id: str | None
+    tool_name: str | None
+    log_comment: str
+
+
+def _build_log_comment(
+    *,
+    query_label: str,
+    query_id: str,
+    trace_id: str | None,
+    span_id: str | None,
+    tool_name: str | None,
+) -> str:
+    """Serialize compact JSON for ClickHouse's ``log_comment`` setting so
+    ``system.query_log`` rows can be joined to OTel/Datadog traces and #123's
+    per-call-site ``query_label``."""
+    service_name = os.getenv("DD_SERVICE") or os.getenv("OTEL_SERVICE_NAME", "cbioportal-mcp")
+    payload: dict[str, str] = {
+        "service": service_name,
+        "query_label": query_label,
+        "query_id": query_id,
+    }
+    if tool_name:
+        payload["tool"] = tool_name
+    if trace_id:
+        payload["trace_id"] = trace_id
+    if span_id:
+        payload["span_id"] = span_id
+    return json.dumps(payload, separators=(",", ":"))
+
+
+@contextmanager
+def traced_db_client_setup():
+    """Wrap ClickHouse client creation/reconnect with its own OTel span
+    (``db.client.setup``) and DogStatsD metrics (``db_client.setup_duration_ms``),
+    separate from ``db_query.duration_ms``."""
+    tracer = trace.get_tracer(__name__)
+    started = time.perf_counter()
+    with tracer.start_as_current_span("db.client.setup") as span:
+        try:
+            yield span
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - started) * 1000
+            span.set_attribute("db.client.setup_duration_ms", duration_ms)
+            span.set_attribute("db.client.setup_success", False)
+            span.set_attribute("error.type", type(exc).__name__)
+            _emit_db_client_setup_metrics(duration_ms=duration_ms, success=False)
+            raise
+        else:
+            duration_ms = (time.perf_counter() - started) * 1000
+            span.set_attribute("db.client.setup_duration_ms", duration_ms)
+            span.set_attribute("db.client.setup_success", True)
+            _emit_db_client_setup_metrics(duration_ms=duration_ms, success=True)
+
+
 @contextmanager
 def traced_db_query(query_label: str):
-    """Wrap one ClickHouse SELECT with an OTel span (``db.query/<label>``) and
-    a Datadog distribution metric, both tagged by query_label so latency can
+    """Wrap one ClickHouse query execution with an OTel span (``db.query/<label>``)
+    and a Datadog distribution metric, both tagged by query_label so latency can
     be broken down by call site in Datadog instead of averaged into one
-    run_select_query number. Re-raises on failure after recording it as a
-    failed call; does not suppress or alter the underlying exception.
+    run_select_query number.
+
+    Yields a ``DbQueryContext`` carrying ``query_id`` and a structured JSON
+    ``log_comment`` linking ClickHouse ``system.query_log`` to the active OTel
+    trace/span. Re-raises on failure after recording it as a failed call; does
+    not suppress or alter the underlying exception.
     """
     tracer = trace.get_tracer(__name__)
     started = time.perf_counter()
+    query_id = uuid.uuid4().hex
+    tool_name = _current_tool_name.get()
     with tracer.start_as_current_span(f"db.query/{query_label}") as span:
+        span_ctx = span.get_span_context()
+        trace_id = format(span_ctx.trace_id, "032x") if span_ctx.is_valid else None
+        span_id = format(span_ctx.span_id, "016x") if span_ctx.is_valid else None
+        log_comment = _build_log_comment(
+            query_label=query_label,
+            query_id=query_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            tool_name=tool_name,
+        )
         span.set_attribute("db.query.label", query_label)
+        span.set_attribute("db.clickhouse.query_id", query_id)
+        query_ctx = DbQueryContext(
+            span=span,
+            query_label=query_label,
+            query_id=query_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            tool_name=tool_name,
+            log_comment=log_comment,
+        )
         try:
-            yield
+            yield query_ctx
         except Exception as exc:
             duration_ms = (time.perf_counter() - started) * 1000
             span.set_attribute("db.query.duration_ms", duration_ms)
@@ -464,6 +581,64 @@ def _llmobs_tool_span(
         return None
 
 
+def _serialize_llmobs_output(result, max_chars: int) -> str:
+    """Serialize an MCP tool result for Datadog LLMObs without re-encoding huge
+    payloads on the event loop.
+
+    When ``max_chars <= 0`` output capture is skipped completely. When
+    ``result.content`` consists of text blocks whose total size exceeds
+    ``max_chars``, the text is sliced directly without calling ``model_dump`` or
+    ``json.dumps`` on the oversized payload.
+    """
+    if max_chars <= 0:
+        return "[output omitted]"
+
+    try:
+        if hasattr(result, "content"):
+            blocks = result.content
+            total_text_len = 0
+            all_text = True
+            for block in blocks:
+                text = getattr(block, "text", None)
+                if isinstance(text, str):
+                    total_text_len += len(text)
+                else:
+                    all_text = False
+                    break
+
+            if all_text and total_text_len > max_chars:
+                chunks: list[str] = []
+                remaining = max_chars
+                for block in blocks:
+                    if remaining <= 0:
+                        break
+                    chunk = block.text[:remaining]
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                return f"{''.join(chunks)}... [truncated {total_text_len} chars]"
+
+            serialized = json.dumps(
+                [
+                    c.model_dump() if hasattr(c, "model_dump") else str(c)
+                    for c in blocks
+                ],
+                default=str,
+            )
+            if len(serialized) > max_chars:
+                return f"{serialized[:max_chars]}... [truncated {len(serialized)} chars]"
+            return serialized
+
+        text = str(result)
+        if len(text) > max_chars:
+            return f"{text[:max_chars]}... [truncated {len(text)} chars]"
+        return text
+    except Exception:
+        text = str(result)
+        if len(text) > max_chars:
+            return f"{text[:max_chars]}... [truncated {len(text)} chars]"
+        return text
+
+
 def _llmobs_finish(span, result, *, error: bool) -> None:
     """Annotate and finish a LLMObs span returned by _llmobs_tool_span."""
     if span is None:
@@ -471,24 +646,11 @@ def _llmobs_finish(span, result, *, error: bool) -> None:
     try:
         from ddtrace.llmobs import LLMObs
 
-        output: str
         if error:
             output = "error"
         else:
-            # Serialize the MCP result content to a compact string for the output field.
-            try:
-                if hasattr(result, "content"):
-                    output = json.dumps(
-                        [
-                            c.model_dump() if hasattr(c, "model_dump") else str(c)
-                            for c in result.content
-                        ],
-                        default=str,
-                    )
-                else:
-                    output = str(result)
-            except Exception:
-                output = str(result)
+            max_chars = get_mcp_config().llmobs_max_output_chars
+            output = _serialize_llmobs_output(result, max_chars)
 
         LLMObs.annotate(span=span, output_data=output)
         span.finish()
@@ -584,6 +746,7 @@ class TelemetryMiddleware(Middleware):
             if client_ip:
                 span.set_attribute("network.client.ip", client_ip)
 
+            tool_token = _current_tool_name.set(tool_name)
             try:
                 result = await call_next(context)
                 duration_ms = (time.perf_counter() - started) * 1000
@@ -613,3 +776,5 @@ class TelemetryMiddleware(Middleware):
                 )
                 _llmobs_finish(llmobs_span, None, error=True)
                 raise
+            finally:
+                _current_tool_name.reset(tool_token)

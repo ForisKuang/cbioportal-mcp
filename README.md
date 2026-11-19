@@ -47,9 +47,32 @@ export CLICKHOUSE_MCP_SERVER_TRANSPORT=stdio # or http or sse
 # export CLICKHOUSE_MCP_HTTP_PATH=/db/mcp
 ```
 
+### Query Limits & Latency Controls
+
+The server reuses a single thread-safe ClickHouse HTTP client (`autogenerate_session_id=False`),
+executes ClickHouse queries off the asyncio event loop so concurrent MCP requests run in parallel,
+and enforces both server-side and client-side guardrails configurable via environment variables:
+
+| Environment Variable | Default | Purpose |
+|---|---|---|
+| `CBIOPORTAL_MCP_MAX_EXECUTION_TIME` | `25` | ClickHouse server-side `max_execution_time` (seconds). Kept below the client timeout so ClickHouse cancels slow queries server-side instead of letting them run until `send_receive_timeout`. Set to `0` to disable. |
+| `CBIOPORTAL_MCP_QUERY_TIMEOUT` | `30` | Client-side query timeout (seconds); also used as the default ClickHouse HTTP `send_receive_timeout` when `CLICKHOUSE_SEND_RECEIVE_TIMEOUT` is unset. |
+| `CBIOPORTAL_MCP_MAX_RESULT_ROWS` | `10000` | ClickHouse server-side `max_result_rows` sent with `result_overflow_mode='break'`. Set to `0` to disable. |
+| `CBIOPORTAL_MCP_MAX_RESULT_BYTES` | `50000000` | ClickHouse server-side `max_result_bytes` (~50 MB) sent with `result_overflow_mode='break'`. Set to `0` to disable. |
+| `CBIOPORTAL_MCP_MAX_ROWS` | `1000` | Maximum rows returned to the LLM by `clickhouse_run_select_query`. Exceeding results are capped and include `"truncated": true` plus a guidance `"message"`. Set to `0` to disable client-side row capping. |
+| `CBIOPORTAL_MCP_LLMOBS_MAX_OUTPUT_CHARS` | `16384` | Maximum characters of tool output attached to Datadog LLMObs spans. Oversized outputs are truncated without re-serializing the full JSON payload on the event loop. Set to `0` to omit output capture. |
+
+> **ClickHouse `readonly` profile note:** Per-query ClickHouse limits and `log_comment` require a
+> ClickHouse user with `readonly = 2` (read-only queries, writable per-query settings). If the user
+> has `readonly = 1`, readonly server settings are omitted with a one-time warning while `query_id`
+> is still sent for `system.query_log` correlation.
+
 ### Datadog Tool Metrics
 
-The server emits one OpenTelemetry span per MCP tool call and can also emit
+The server emits OpenTelemetry spans (`mcp.tool/<tool>`, `db.query/<query_label>`, and
+`db.client.setup`) and attaches `query_id` + structured JSON `log_comment` (`service`,
+`query_label`, `query_id`, `tool`, `trace_id`, `span_id`) to every ClickHouse query so
+`system.query_log` entries can be joined directly to Datadog traces. It can also emit
 DogStatsD metrics for dashboard-level aggregates:
 
 | Metric | Type | Purpose |
@@ -57,6 +80,12 @@ DogStatsD metrics for dashboard-level aggregates:
 | `cbioportal_mcp.tool.calls` | counter | Tool-call volume by `tool`, `success`, `client_kind`, and `client_name` |
 | `cbioportal_mcp.tool.duration_ms` | distribution | Tool latency, including p50/p95/p99 by tool |
 | `cbioportal_mcp.tool.errors` | counter | Tool-call failures by tool/client |
+| `cbioportal_mcp.db_query.calls` | counter | ClickHouse query volume by `query_label` and `success` |
+| `cbioportal_mcp.db_query.duration_ms` | distribution | ClickHouse query execution latency by `query_label` (excludes client setup and Python dict conversion) |
+| `cbioportal_mcp.db_query.errors` | counter | ClickHouse query failures by `query_label` |
+| `cbioportal_mcp.db_client.connects` | counter | ClickHouse client initialization/reconnect count by `success` |
+| `cbioportal_mcp.db_client.setup_duration_ms` | distribution | ClickHouse client setup/handshake latency, separated from `db_query.duration_ms` |
+| `cbioportal_mcp.db_client.errors` | counter | ClickHouse client setup failures |
 
 DogStatsD metrics are enabled by default when `DD_AGENT_HOST` or
 `DD_DOGSTATSD_HOST` is configured:

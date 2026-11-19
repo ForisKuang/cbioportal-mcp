@@ -15,30 +15,29 @@ if _dd_api_key:
         integrations_enabled=True,
     )
 
+import asyncio
 import json
 import logging
 import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, partial
 from importlib import resources as importlib_resources
 from pathlib import Path
-from typing import Optional
+
+import anyio
+import mcp.types as mt
 from fastmcp import FastMCP
 
-
-import mcp.types as mt
-
-from cbioportal_mcp.env import get_mcp_config, TransportType
-from cbioportal_mcp.authentication.permissions import ensure_db_permissions
 from cbioportal_mcp.auth import _build_auth_provider
+from cbioportal_mcp.authentication.permissions import ensure_db_permissions
+from cbioportal_mcp.clickhouse import execute_query
+from cbioportal_mcp.env import TransportType, get_mcp_config
 from cbioportal_mcp.telemetry import (
     TelemetryMiddleware,
     configure_telemetry,
     dogstatsd_metrics_configured,
-    traced_db_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -384,6 +383,51 @@ def study_resolution_guide() -> str:
     return _study_resolution_guide_text()
 
 
+async def _run_in_thread(fn, *args, timeout_seconds: int | None = None, **kwargs):
+    """Run blocking ClickHouse work in an anyio worker thread so the event loop
+    never stalls on slow queries.
+
+    ``anyio.to_thread.run_sync`` automatically copies ``contextvars`` into the
+    worker thread, preserving the active OTel span and tool name for
+    ``traced_db_query`` and ClickHouse ``log_comment`` correlation.
+    """
+    call = partial(fn, *args, **kwargs) if (args or kwargs) else fn
+    if timeout_seconds is not None and timeout_seconds > 0:
+        with anyio.fail_after(timeout_seconds):
+            return await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+    return await anyio.to_thread.run_sync(call)
+
+
+def _run_select_query_capped(
+    query: str, *, query_label: str, max_rows: int
+) -> tuple[list[dict], bool]:
+    """Execute a SELECT query and cap rows returned to the LLM.
+
+    Slices raw rows before dict conversion so rows past the cap are never
+    materialized as Python dicts. Also treats ClickHouse ``result_bytes``
+    reaching ``max_result_bytes`` (under ``result_overflow_mode='break'``) as
+    truncation.
+    """
+    config = get_mcp_config()
+    ch_query_result = execute_query(query, query_label=query_label)
+    raw_rows = ch_query_result["rows"]
+    truncated = max_rows > 0 and len(raw_rows) > max_rows
+
+    if not truncated and config.max_result_bytes > 0:
+        summary = ch_query_result.get("summary") or {}
+        try:
+            if int(summary.get("result_bytes", 0)) >= config.max_result_bytes:
+                truncated = True
+        except (TypeError, ValueError):
+            pass
+
+    rows = zip_select_query_result(
+        ch_query_result,
+        max_rows=max_rows if max_rows > 0 else None,
+    )
+    return rows, truncated
+
+
 @mcp.tool(
     description="""
     Execute a ClickHouse SQL SELECT query.
@@ -398,18 +442,46 @@ def study_resolution_guide() -> str:
     - cbioportal://common-pitfalls - Common query mistakes and how to avoid them
 
     Returns:
-        - On success: an object with a single field "rows" containing an array of result rows.
+        - On success: an object with a "rows" field containing an array of result rows.
+          If the result exceeds the configured row/byte cap, "truncated": true and a
+          guidance "message" are also included.
         - On failure: an object with a single field "error_message" containing a string describing the error.
 """
 )
-def clickhouse_run_select_query(query: str) -> dict[str, list[dict] | str]:
+async def clickhouse_run_select_query(query: str) -> dict[str, list[dict] | str | bool]:
+    config = get_mcp_config()
+    max_rows = config.max_returned_rows
+    timeout_seconds = config.query_timeout_seconds
     try:
-        result = run_select_query(query, query_label="clickhouse_run_select_query")
-        logger.debug(f"clickhouse_run_select_query returns {result}")
-        return {"rows": result}
+        rows, truncated = await _run_in_thread(
+            _run_select_query_capped,
+            query,
+            timeout_seconds=timeout_seconds,
+            query_label="clickhouse_run_select_query",
+            max_rows=max_rows,
+        )
+        logger.debug(
+            "clickhouse_run_select_query returned %d rows (truncated=%s)",
+            len(rows),
+            truncated,
+        )
+        if truncated:
+            return {
+                "rows": rows,
+                "truncated": True,
+                "message": (
+                    f"Result truncated to {len(rows)} rows (limit: {max_rows} rows). "
+                    "Add a LIMIT, WHERE filter, or GROUP BY aggregation to narrow the result."
+                ),
+            }
+        return {"rows": rows}
+    except TimeoutError:
+        error_message = f"Query timed out after {timeout_seconds} seconds"
+        logger.error("clickhouse_run_select_query: %s", error_message)
+        return {"error_message": error_message}
     except Exception as e:
         error_message = str(e)
-        logger.error(f"clickhouse_run_select_query: {error_message}")
+        logger.error("clickhouse_run_select_query: %s", error_message)
         return {"error_message": error_message}
 
 
@@ -423,19 +495,28 @@ def clickhouse_run_select_query(query: str) -> dict[str, list[dict] | str]:
         - On failure: an object with a single field "error_message" containing a string describing the error.
 """
 )
-def clickhouse_list_tables() -> dict[str, list[dict] | str]:
-    logger.info(f"clickhouse_list_tables: called")
+async def clickhouse_list_tables() -> dict[str, list[dict] | str]:
+    logger.info("clickhouse_list_tables: called")
+    config = get_mcp_config()
 
     try:
-        from mcp_clickhouse.mcp_server import execute_query
-        raw = execute_query("SHOW TABLES")
+        raw = await _run_in_thread(
+            execute_query,
+            "SHOW TABLES",
+            timeout_seconds=config.query_timeout_seconds,
+            query_label="clickhouse_list_tables",
+        )
         rows = raw.get("rows", [])
         result = [{"name": row[0]} for row in rows if row]
-        logger.debug(f"clickhouse_list_tables result: {result}")
+        logger.debug("clickhouse_list_tables returned %d tables", len(result))
         return {"tables": result}
+    except TimeoutError:
+        error_message = f"Query timed out after {config.query_timeout_seconds} seconds"
+        logger.error("clickhouse_list_tables: %s", error_message)
+        return {"error_message": error_message}
     except Exception as e:
         error_message = str(e)
-        logger.error(f"clickhouse_list_tables: {error_message}")
+        logger.error("clickhouse_list_tables: %s", error_message)
         return {"error_message": error_message}
 
 
@@ -451,13 +532,18 @@ def clickhouse_list_tables() -> dict[str, list[dict] | str]:
         - On failure: an object with a single field "error_message" containing a string describing the error.
 """
 )
-def clickhouse_list_table_columns(table: str) -> dict[str, list[dict] | str]:
-    logger.info(f"clickhouse_list_table_columns: called")
+async def clickhouse_list_table_columns(table: str) -> dict[str, list[dict] | str]:
+    logger.info("clickhouse_list_table_columns: called")
+    config = get_mcp_config()
 
     try:
         table = _validate_table_name(table)
-        from mcp_clickhouse.mcp_server import execute_query
-        raw = execute_query(f"DESCRIBE TABLE {table}")
+        raw = await _run_in_thread(
+            execute_query,
+            f"DESCRIBE TABLE {table}",
+            timeout_seconds=config.query_timeout_seconds,
+            query_label="clickhouse_list_table_columns",
+        )
         columns_list = raw.get("columns", [])
         rows = raw.get("rows", [])
         # DESCRIBE TABLE returns: name, type, default_type, default_expression, comment, ...
@@ -474,11 +560,15 @@ def clickhouse_list_table_columns(table: str) -> dict[str, list[dict] | str]:
             if len(row) > comment_idx and row[comment_idx]:
                 entry["comment"] = row[comment_idx]
             result.append(entry)
-        logger.debug(f"clickhouse_list_table_columns result: {result}")
+        logger.debug("clickhouse_list_table_columns returned %d columns", len(result))
         return {"columns": result}
+    except TimeoutError:
+        error_message = f"Query timed out after {config.query_timeout_seconds} seconds"
+        logger.error("clickhouse_list_table_columns: %s", error_message)
+        return {"error_message": error_message}
     except Exception as e:
         error_message = str(e)
-        logger.error(f"clickhouse_list_table_columns: {error_message}")
+        logger.error("clickhouse_list_table_columns: %s", error_message)
         return {"error_message": error_message}
 
 
@@ -491,36 +581,30 @@ def run_select_query(query: str, *, query_label: str) -> list[dict]:
 
     Args:
         query_label: Identifies the call site for telemetry (a Datadog span +
-            metric tag), e.g. "study_guide.counts". run_select_query() is a
-            single funnel for every SELECT this server runs, so without a
-            per-call-site label its own latency metric would average a cheap
-            lookup together with an expensive multi-table aggregate. Use
-            "area.purpose", not the raw SQL text.
+            metric tag + ClickHouse log_comment), e.g. "study_guide.counts".
+            run_select_query() is a single funnel for every SELECT this server
+            runs, so without a per-call-site label its own latency metric would
+            average a cheap lookup together with an expensive multi-table
+            aggregate. Use "area.purpose", not the raw SQL text.
 
     Returns:
         list: A list of rows, where each row is a dictionary with column names as keys and corresponding values.
     """
-    from mcp_clickhouse.mcp_server import run_select_query
-
     # DB-level read-only permissions (enforced on startup) prevent non-SELECT queries,
     # so we don't need application-level query filtering. This allows CTEs (WITH ... AS).
-    logger.debug("run_select_query: delegate the query to run_select_query tool of ClickHouse MCP")
-    with traced_db_query(query_label):
-        ch_query_result = run_select_query(query)
-        result = zip_select_query_result(ch_query_result)
-    return result
+    ch_query_result = execute_query(query, query_label=query_label)
+    return zip_select_query_result(ch_query_result)
 
 
-def zip_select_query_result(ch_query_result) -> list[dict]:
+def zip_select_query_result(ch_query_result, *, max_rows: int | None = None) -> list[dict]:
     """
-    Join columns and corresponding row values into dictionaries skipping dictionary entries if value is emtpy or None
+    Join columns and corresponding row values into dictionaries skipping dictionary entries if value is empty or None.
     """
     columns = ch_query_result["columns"]
     rows = ch_query_result["rows"]
-    result = []
-    for row in rows:
-        result.append({k: v for k, v in zip(columns, row) if v not in ("", None)})
-    return result
+    if max_rows is not None and max_rows > 0:
+        rows = rows[:max_rows]
+    return [{k: v for k, v in zip(columns, row) if v not in ("", None)} for row in rows]
 
 
 # Resource Access Tools for AI Agents
@@ -721,7 +805,7 @@ def _study_not_in_deployment_message(study_id: str) -> str:
 
 
 @mcp.tool()
-def get_study_guide(study_id: str) -> str:
+async def get_study_guide(study_id: str) -> str:
     """Get a guide for a specific cBioPortal study.
     
     First checks for a pre-generated guide in resources/study-guides/{study_id}.md.
@@ -748,21 +832,24 @@ def get_study_guide(study_id: str) -> str:
     try:
         static_guide = _load_study_guide(study_id)
     except Exception as e:
-        logger.error(f"Error reading resolved static guide for {study_id}: {e}")
+        logger.error("Error reading resolved static guide for %s: %s", study_id, e)
         return f"Error: A study guide was found for '{study_id}' but could not be read: {e}"
     if static_guide:
-        logger.info(f"Loaded static study guide for {study_id}")
+        logger.info("Loaded static study guide for %s", study_id)
         return static_guide
 
     # Fall back to dynamic generation
-    logger.info(f"Generating dynamic study guide for {study_id}")
+    logger.info("Generating dynamic study guide for %s", study_id)
+    timeout_seconds = get_mcp_config().query_timeout_seconds
     try:
         guide_sections = []
         
         # 1. Basic study info
         # Match case-insensitively: identifiers are lowercase by convention, but a
         # user who types 'NBL_MSK_2023' must not be told the study is missing.
-        study_info = run_select_query(f"""
+        study_info = await _run_in_thread(
+            run_select_query,
+            f"""
             SELECT
                 cancer_study_identifier,
                 name,
@@ -770,10 +857,17 @@ def get_study_guide(study_id: str) -> str:
                 type_of_cancer_id
             FROM cancer_study
             WHERE lower(cancer_study_identifier) = lower('{study_id}')
-        """, query_label="study_guide.study_info")
+        """,
+            timeout_seconds=timeout_seconds,
+            query_label="study_guide.study_info",
+        )
 
         if not study_info:
-            return _study_not_in_deployment_message(study_id)
+            return await _run_in_thread(
+                _study_not_in_deployment_message,
+                study_id,
+                timeout_seconds=timeout_seconds,
+            )
 
         info = study_info[0]
         # Adopt the identifier exactly as the database spells it, so every section
@@ -787,15 +881,13 @@ def get_study_guide(study_id: str) -> str:
 """)
 
         # Sections 2-7 below only depend on study_id, not on each other or on
-        # section order, so they're fired concurrently here instead of one
-        # ClickHouse round trip at a time -- each pays the same fixed
-        # per-call connection overhead (see run_select_query), so six
-        # sequential calls cost roughly six times that overhead in wall
-        # clock, while six concurrent ones cost roughly one. Results are
-        # still consumed in the original section order below, so the guide's
-        # output is unchanged regardless of which query finishes first.
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            counts_future = executor.submit(
+        # section order, so they're fired concurrently off the event loop via
+        # anyio worker threads (which also propagate the active OTel span and
+        # tool context into every query). Results are still consumed in the
+        # original section order below, so the guide's output is unchanged
+        # regardless of which query finishes first.
+        counts, profiles, panels, attrs, top_genes, sample_types = await asyncio.gather(
+            _run_in_thread(
                 run_select_query,
                 f"""
                     SELECT
@@ -804,9 +896,10 @@ def get_study_guide(study_id: str) -> str:
                     FROM clinical_data_derived
                     WHERE cancer_study_identifier = '{study_id}'
                 """,
+                timeout_seconds=timeout_seconds,
                 query_label="study_guide.counts",
-            )
-            profiles_future = executor.submit(
+            ),
+            _run_in_thread(
                 run_select_query,
                 f"""
                     SELECT DISTINCT
@@ -817,9 +910,10 @@ def get_study_guide(study_id: str) -> str:
                     JOIN cancer_study cs ON gp.cancer_study_id = cs.cancer_study_id
                     WHERE cs.cancer_study_identifier = '{study_id}'
                 """,
+                timeout_seconds=timeout_seconds,
                 query_label="study_guide.profiles",
-            )
-            panels_future = executor.submit(
+            ),
+            _run_in_thread(
                 run_select_query,
                 f"""
                     SELECT DISTINCT gene_panel_id, COUNT(DISTINCT sample_unique_id) as sample_count
@@ -829,9 +923,10 @@ def get_study_guide(study_id: str) -> str:
                     ORDER BY sample_count DESC
                     LIMIT 10
                 """,
+                timeout_seconds=timeout_seconds,
                 query_label="study_guide.panels",
-            )
-            attrs_future = executor.submit(
+            ),
+            _run_in_thread(
                 run_select_query,
                 f"""
                     SELECT DISTINCT attribute_name, COUNT(DISTINCT sample_unique_id) as coverage
@@ -841,9 +936,10 @@ def get_study_guide(study_id: str) -> str:
                     ORDER BY coverage DESC
                     LIMIT 20
                 """,
+                timeout_seconds=timeout_seconds,
                 query_label="study_guide.attrs",
-            )
-            top_genes_future = executor.submit(
+            ),
+            _run_in_thread(
                 run_select_query,
                 f"""
                     SELECT
@@ -857,9 +953,10 @@ def get_study_guide(study_id: str) -> str:
                     ORDER BY altered_samples DESC
                     LIMIT 10
                 """,
+                timeout_seconds=timeout_seconds,
                 query_label="study_guide.top_genes",
-            )
-            sample_types_future = executor.submit(
+            ),
+            _run_in_thread(
                 run_select_query,
                 f"""
                     SELECT attribute_value as sample_type, COUNT(DISTINCT sample_unique_id) as count
@@ -869,11 +966,12 @@ def get_study_guide(study_id: str) -> str:
                     GROUP BY attribute_value
                     ORDER BY count DESC
                 """,
+                timeout_seconds=timeout_seconds,
                 query_label="study_guide.sample_types",
-            )
+            ),
+        )
 
-            # 2. Patient and sample counts
-            counts = counts_future.result()
+        # 2. Patient and sample counts
         if counts:
             c = counts[0]
             guide_sections.append(f"""## Cohort Statistics
@@ -882,7 +980,6 @@ def get_study_guide(study_id: str) -> str:
 """)
         
         # 3. Available data types
-        profiles = profiles_future.result()
         if profiles:
             guide_sections.append("## Available Data Types\n")
             for p in profiles:
@@ -890,7 +987,6 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 4. Gene panels used
-        panels = panels_future.result()
         if panels:
             guide_sections.append("## Gene Panels\n")
             for p in panels:
@@ -903,7 +999,6 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 5. Clinical attributes available
-        attrs = attrs_future.result()
         if attrs:
             guide_sections.append("## Available Clinical Attributes\n")
             guide_sections.append("| Attribute | Samples with Data |")
@@ -913,7 +1008,6 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 6. Top mutated genes (if mutation data exists)
-        top_genes = top_genes_future.result()
         if top_genes:
             guide_sections.append("## Top Mutated Genes\n")
             guide_sections.append("| Gene | Altered Samples |")
@@ -923,7 +1017,6 @@ def get_study_guide(study_id: str) -> str:
             guide_sections.append("")
         
         # 7. Sample type distribution
-        sample_types = sample_types_future.result()
         if sample_types:
             guide_sections.append("## Sample Types\n")
             for st in sample_types:
@@ -1097,7 +1190,7 @@ def _filter_studies(search: str | None, limit: int, verbose: bool) -> list[dict]
 
 
 @mcp.tool()
-def list_studies(search: str = None, limit: int = 20, verbose: bool = False) -> list[dict]:
+async def list_studies(search: str = None, limit: int = 20, verbose: bool = False) -> list[dict]:
     """List available cBioPortal studies.
 
     Studies with pre-generated guides (in resources/study-guides/) will have has_guide=True.
@@ -1117,7 +1210,13 @@ def list_studies(search: str = None, limit: int = 20, verbose: bool = False) -> 
     safe_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
     
     try:
-        results = _filter_studies(search, safe_limit, bool(verbose))
+        results = await _run_in_thread(
+            _filter_studies,
+            search,
+            safe_limit,
+            bool(verbose),
+            timeout_seconds=get_mcp_config().query_timeout_seconds,
+        )
 
         # Add has_guide field
         for study in results:
@@ -1127,7 +1226,7 @@ def list_studies(search: str = None, limit: int = 20, verbose: bool = False) -> 
         return results
         
     except Exception as e:
-        logger.error(f"list_studies error: {e}")
+        logger.error("list_studies error: %s", e)
         return [{"error": str(e)}]
 
 

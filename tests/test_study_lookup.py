@@ -5,6 +5,8 @@ defects fed that: the lookup was case-sensitive, and the miss message asserted
 non-existence instead of describing a deployment-scoped lookup failure.
 """
 
+import asyncio
+
 import pytest
 
 from cbioportal_mcp import server
@@ -12,7 +14,7 @@ from cbioportal_mcp import server
 
 def _guide(study_id: str) -> str:
     """Call the tool's underlying function; @mcp.tool wraps it in a FunctionTool."""
-    return server.get_study_guide.fn(study_id)
+    return asyncio.run(server.get_study_guide.fn(study_id))
 
 
 CANCER_STUDY_ROW = {
